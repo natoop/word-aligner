@@ -1,0 +1,24 @@
+name: word-aligner
+
+services:
+  api:
+    image: word-aligner:latest
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ALIGNER_MODEL: xlmr
+      ALIGNER_TOKEN_TYPE: bpe
+      ALIGNER_MATCHING_METHODS: mai
+      ALIGNER_DEVICE: cpu
+      ALIGNER_EAGER_LOAD: "true"
+      HF_HOME: /models
+      HF_MODEL_UPDATE_POLICY: if-missing
+    volumes:
+      - model-cache:/models
+    restart: unless-stopped
+
+volumes:
+  model-cache:
+    # Reuse the existing cache so the project rename does not redownload XLM-R.
+    name: sentence-align_sentence-align-models

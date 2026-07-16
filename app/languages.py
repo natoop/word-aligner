@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from app.schemas import SupportedLanguage
+
+
+# Languages exposed by this service have XLM-R coverage and usable word
+# boundaries with either the dedicated Chinese tokenizer or the Unicode
+# tokenizer used by the API. Languages such as Japanese and Thai require an
+# additional language-specific segmenter and are intentionally not advertised.
+SUPPORTED_LANGUAGES: tuple[SupportedLanguage, ...] = (
+    SupportedLanguage(code="af", name="Afrikaans", native_name="Afrikaans", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ar", name="Arabic", native_name="العربية", tokenizer="unicode-regex"),
+    SupportedLanguage(code="bg", name="Bulgarian", native_name="Български", tokenizer="unicode-regex"),
+    SupportedLanguage(code="bn", name="Bengali", native_name="বাংলা", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ca", name="Catalan", native_name="Català", tokenizer="unicode-regex"),
+    SupportedLanguage(code="cs", name="Czech", native_name="Čeština", tokenizer="unicode-regex"),
+    SupportedLanguage(code="da", name="Danish", native_name="Dansk", tokenizer="unicode-regex"),
+    SupportedLanguage(code="de", name="German", native_name="Deutsch", tokenizer="unicode-regex"),
+    SupportedLanguage(code="el", name="Greek", native_name="Ελληνικά", tokenizer="unicode-regex"),
+    SupportedLanguage(code="en", name="English", native_name="English", tokenizer="unicode-regex"),
+    SupportedLanguage(code="es", name="Spanish", native_name="Español", tokenizer="unicode-regex"),
+    SupportedLanguage(code="et", name="Estonian", native_name="Eesti", tokenizer="unicode-regex"),
+    SupportedLanguage(code="eu", name="Basque", native_name="Euskara", tokenizer="unicode-regex"),
+    SupportedLanguage(code="fa", name="Persian", native_name="فارسی", tokenizer="unicode-regex"),
+    SupportedLanguage(code="fi", name="Finnish", native_name="Suomi", tokenizer="unicode-regex"),
+    SupportedLanguage(code="fr", name="French", native_name="Français", tokenizer="unicode-regex"),
+    SupportedLanguage(code="gl", name="Galician", native_name="Galego", tokenizer="unicode-regex"),
+    SupportedLanguage(code="he", name="Hebrew", native_name="עברית", tokenizer="unicode-regex"),
+    SupportedLanguage(code="hi", name="Hindi", native_name="हिन्दी", tokenizer="unicode-regex"),
+    SupportedLanguage(code="hr", name="Croatian", native_name="Hrvatski", tokenizer="unicode-regex"),
+    SupportedLanguage(code="hu", name="Hungarian", native_name="Magyar", tokenizer="unicode-regex"),
+    SupportedLanguage(code="id", name="Indonesian", native_name="Bahasa Indonesia", tokenizer="unicode-regex"),
+    SupportedLanguage(code="is", name="Icelandic", native_name="Íslenska", tokenizer="unicode-regex"),
+    SupportedLanguage(code="it", name="Italian", native_name="Italiano", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ko", name="Korean", native_name="한국어", tokenizer="unicode-regex"),
+    SupportedLanguage(code="lt", name="Lithuanian", native_name="Lietuvių", tokenizer="unicode-regex"),
+    SupportedLanguage(code="lv", name="Latvian", native_name="Latviešu", tokenizer="unicode-regex"),
+    SupportedLanguage(code="mk", name="Macedonian", native_name="Македонски", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ms", name="Malay", native_name="Bahasa Melayu", tokenizer="unicode-regex"),
+    SupportedLanguage(code="nl", name="Dutch", native_name="Nederlands", tokenizer="unicode-regex"),
+    SupportedLanguage(code="no", name="Norwegian", native_name="Norsk", tokenizer="unicode-regex"),
+    SupportedLanguage(code="pl", name="Polish", native_name="Polski", tokenizer="unicode-regex"),
+    SupportedLanguage(code="pt", name="Portuguese", native_name="Português", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ro", name="Romanian", native_name="Română", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ru", name="Russian", native_name="Русский", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sk", name="Slovak", native_name="Slovenčina", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sl", name="Slovenian", native_name="Slovenščina", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sq", name="Albanian", native_name="Shqip", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sr", name="Serbian", native_name="Српски", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sv", name="Swedish", native_name="Svenska", tokenizer="unicode-regex"),
+    SupportedLanguage(code="sw", name="Swahili", native_name="Kiswahili", tokenizer="unicode-regex"),
+    SupportedLanguage(code="tl", name="Tagalog", native_name="Tagalog", tokenizer="unicode-regex"),
+    SupportedLanguage(code="tr", name="Turkish", native_name="Türkçe", tokenizer="unicode-regex"),
+    SupportedLanguage(code="uk", name="Ukrainian", native_name="Українська", tokenizer="unicode-regex"),
+    SupportedLanguage(code="ur", name="Urdu", native_name="اردو", tokenizer="unicode-regex"),
+    SupportedLanguage(code="vi", name="Vietnamese", native_name="Tiếng Việt", tokenizer="unicode-regex"),
+    SupportedLanguage(code="zh-Hans", name="Simplified Chinese", native_name="简体中文", tokenizer="jieba"),
+    SupportedLanguage(code="zh-Hant", name="Traditional Chinese", native_name="繁體中文", tokenizer="jieba"),
+)
