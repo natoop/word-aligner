@@ -9,10 +9,10 @@ SentencePiece is useful for subword tokenization and model encoding, but it does
 ```text
 Source/target text -> word tokenization -> contextual subword embeddings
 -> mean-pooled word embeddings -> similarity matrix -> SimAlign matching
--> confidence scoring and conservative repair -> grouped relations and character offsets
+-> relative confidence scoring and span refinement -> grouped relations and character offsets
 ```
 
-Chinese (`zh`, `zh-Hans`, and `zh-Hant`) uses `jieba` for display-level word tokenization. Placeholders and markup such as `[[T1504_1]]`, `${name}`, `{{name}}`, and HTML tags are preserved as complete tokens and force-aligned when their text is identical.
+Chinese (`zh`, `zh-Hans`, and `zh-Hant`) uses `jieba` for display-level word tokenization. Placeholders, markup, and index-arrow expressions such as `[[T1504_1]]`, `${name}`, `{{name}}`, HTML tags, `5→3`, and `6->4` are preserved as complete tokens and force-aligned by identical text and occurrence order.
 
 ## Getting Started
 
@@ -92,7 +92,11 @@ Request:
     "strategy": "conservative",
     "max_position_distance": 0.35,
     "min_similarity": 0.45,
-    "min_confidence": 0.35
+    "min_confidence": 0.35,
+    "max_source_span": 3,
+    "max_target_span": 6,
+    "min_score_gain": 0.05,
+    "min_span_coverage": 0.75
   },
   "sentence_pairs": [
     {
@@ -114,13 +118,25 @@ Field constraints:
 - `source_language` and `target_language`: BCP 47-style language codes such as `en`, `zh-Hans`, and `de`.
 - `sentence_pairs`: 1–100 already-corresponding sentence pairs. Each source or target text can contain up to 10,000 characters.
 - `method`: defaults to `itermax`, which usually provides a balanced precision/recall tradeoff. `inter` is more conservative, while `mwmf` returns maximum-weight matching results.
-- `repair`: optional. When omitted, the service returns the original model result. When present, conservative missing-link repair is enabled.
-- `repair.strategy`: currently supports only `conservative`.
+- `repair`: optional. When omitted, the service returns the original model result. When present, missing-link repair and bounded phrase refinement are enabled.
+- `repair.strategy`: `conservative` (default) or `span-aware`.
 - `repair.max_position_distance`: maximum normalized source/target token-position distance, from `0` to `1`; defaults to `0.35`.
 - `repair.min_similarity`: minimum normalized cosine similarity for a repaired link; defaults to `0.45`.
 - `repair.min_confidence`: minimum estimated confidence for a repaired link; defaults to `0.35`.
+- `repair.max_source_span`: maximum source-token count in a refined span; defaults to `3`.
+- `repair.max_target_span`: maximum target-token count in a refined span; defaults to `6`.
+- `repair.min_score_gain`: minimum pooled-embedding score improvement for a `span-aware` expansion; defaults to `0.05`.
+- `repair.min_span_coverage`: coverage threshold used to detect asymmetric clauses and accept expansions; defaults to `0.75`.
 
-Conservative repair does not force every unaligned token onto a neighboring token. It considers only content for which both sides remain unaligned, uses `mwmf` from the same embedding inference as a candidate, and filters by similarity, confidence, positional distance, and neighboring alignment anchors. Each repaired token can participate in only one new relationship. For example, if `itermax` misses `machine ↔ آلة` while `mwmf` finds a sufficiently strong candidate, the service adds it with `origin: "repaired"`. A token remains unaligned when only one side has a viable candidate or the score thresholds are not met.
+Conservative repair does not force every unaligned token onto a neighboring token. It first considers only content for which both sides remain unaligned, uses `mwmf` from the same embedding inference as a candidate, and filters by similarity, confidence, positional distance, and neighboring alignment anchors. Each repaired token can participate in only one new relationship.
+
+It then checks clauses bounded by aligned punctuation or protected-token anchors. If the clause has usable alignment evidence but either side remains below `min_span_coverage`, ambiguous lexical links are refined without crossing those anchors. A clause that fits within `max_source_span` and `max_target_span` becomes one explicit `origin: "refined"` phrase group. For example, `北方的北方 ↔ The far north of the North` is represented as a `many-to-many` group rather than preserving a high-scoring but semantically wrong `北方 ↔ The` link.
+
+When the full clause is larger than either limit, the limits apply to each local candidate span rather than disabling refinement. A bounded monotonic optimizer combines mean-pooled span similarity, neighborhood-relative evidence, and balanced token-position boundaries. It preserves self-contained model groups and rewrites only spans containing omissions, expansions, or cross-group links. Thus `This is a machine translation example. ↔ 这是一个机器翻译示例。` becomes `This is ↔ 这是`, `a ↔ 一个`, `machine translation ↔ 机器翻译`, and the unchanged model group `example ↔ 示例`. Local optimization is capped at 64 content tokens across both sides. Punctuation links remain atomic, and tokens covered by explicit phrase groups are not reported as unaligned.
+
+Full coverage does not automatically imply correct token roles. Within an anchored clause, a contiguous one-to-one chain that runs in exact reverse target order is collapsed into one local refined phrase group. This handles swaps such as `原子/链接 → links/atomic` as `原子链接 ↔ atomic links` while leaving the surrounding reordered but semantically valid links intact. Wider or non-contiguous reordering is not rewritten by this conservative crossing rule.
+
+`span-aware` includes the same conservative behavior and can additionally expand only one side of an existing group to contiguous, currently unaligned tokens when mean-pooled span embeddings improve by at least `min_score_gain`. Expansions cannot overlap, cross punctuation or protected-token anchors, or exceed the configured span limits.
 
 Response structure example (alignment content is illustrative; actual results depend on the model):
 
@@ -131,7 +147,7 @@ Response structure example (alignment content is illustrative; actual results de
   "model": "xlmr",
   "embedding_layer": 8,
   "method": "itermax",
-  "confidence_method": "bidirectional-softmax-margin-v1",
+  "confidence_method": "bidirectional-margin-span-v2",
   "sentence_alignments": [
     {
       "index": 0,
@@ -152,6 +168,9 @@ Response structure example (alignment content is illustrative; actual results de
       "alignment_groups": [
         {
           "type": "many-to-one",
+          "origin": "model",
+          "similarity": 0.895,
+          "confidence": 0.835,
           "source_indices": [0, 1],
           "target_indices": [0],
           "source_tokens": ["New", "York"],
@@ -169,17 +188,19 @@ Response structure example (alignment content is illustrative; actual results de
 }
 ```
 
-`origin` identifies how each link was created:
+Link `origin` identifies how each atomic relation was created:
 
 - `model`: returned by the selected SimAlign method.
 - `rule`: created by exact placeholder or markup matching.
 - `repaired`: added by conservative repair.
 
-`similarity` is `(cosine + 1) / 2` for the contextual word-token embeddings. `confidence` is an uncalibrated estimate combining bidirectional softmax probabilities, source/target candidate margins, mutual-best status, and agreement across enabled matching methods. Rule links use `1.0` for both values. The response exposes `confidence_method` so clients can distinguish this estimate from a future probability calibrated on labeled alignments.
+Groups also expose `origin`, `similarity`, and `confidence`. A group with one link origin inherits that origin, a component containing multiple origins is `mixed`, and an explicit phrase span is `refined`. A conservative collapsed group has an empty `links` array because the service is intentionally withholding ambiguous token-level claims; a `span-aware` expansion retains its underlying evidence links.
+
+Atomic-link `similarity` is `(cosine + 1) / 2` for contextual word-token embeddings. `confidence` is an uncalibrated v2 estimate combining bidirectional probability (`35%`), relative candidate margins (`30%`), agreement across enabled matching methods (`20%`), and local span/order consistency (`15%`). The candidate evidence is CSLS-style and neighborhood-relative, so uniformly high XLM-R cosine values do not dominate the estimate. Rule links use `1.0` for both values. The response exposes `confidence_method` so clients can distinguish this estimate from a future probability calibrated on labeled alignments.
 
 `start` and `end` are zero-based, half-open offsets measured in Unicode code points. In Python, `text[start:end]` returns the original token. The service preserves leading and trailing whitespace, so offsets always refer to the exact request text.
 
-JavaScript string indices use UTF-16 code units. If a non-BMP character such as an emoji appears before a token, convert the code-point offset to a UTF-16 offset before slicing. Frontends should normally consume `alignment_groups` for bilingual highlighting and use the two `unaligned_*_indices` fields to display unaligned content.
+JavaScript string indices use UTF-16 code units. If a non-BMP character such as an emoji appears before a token, convert the code-point offset to a UTF-16 offset before slicing. Frontends should normally consume `alignment_groups` for bilingual highlighting and use the two `unaligned_*_indices` fields to display unaligned content. Explicit refined spans count as aligned even when their `links` array is empty.
 
 ### Health Checks
 

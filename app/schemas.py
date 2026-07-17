@@ -20,7 +20,8 @@ NonEmptyText = Annotated[
 AlignmentMethod = Literal["itermax", "inter", "mwmf"]
 AlignmentType = Literal["one-to-one", "one-to-many", "many-to-one", "many-to-many"]
 AlignmentLinkOrigin = Literal["model", "rule", "repaired"]
-ConfidenceMethod = Literal["bidirectional-softmax-margin-v1"]
+AlignmentGroupOrigin = Literal["model", "rule", "repaired", "refined", "mixed"]
+ConfidenceMethod = Literal["bidirectional-margin-span-v2"]
 WordTokenizerType = Literal["unicode-regex", "jieba"]
 
 
@@ -43,10 +44,34 @@ class RepairOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    strategy: Literal["conservative"] = "conservative"
+    strategy: Literal["conservative", "span-aware"] = "conservative"
     max_position_distance: float = Field(default=0.35, ge=0.0, le=1.0)
     min_similarity: float = Field(default=0.45, ge=0.0, le=1.0)
     min_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
+    max_source_span: int = Field(
+        default=3,
+        ge=1,
+        le=32,
+        description="Maximum source-token count per local refined span",
+    )
+    max_target_span: int = Field(
+        default=6,
+        ge=1,
+        le=32,
+        description="Maximum target-token count per local refined span",
+    )
+    min_score_gain: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Minimum pooled-embedding gain for span-aware expansion",
+    )
+    min_span_coverage: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Coverage threshold for conservative clause refinement",
+    )
 
 
 class AlignmentRequest(BaseModel):
@@ -63,6 +88,10 @@ class AlignmentRequest(BaseModel):
                     "max_position_distance": 0.35,
                     "min_similarity": 0.45,
                     "min_confidence": 0.35,
+                    "max_source_span": 3,
+                    "max_target_span": 6,
+                    "min_score_gain": 0.05,
+                    "min_span_coverage": 0.75,
                 },
                 "sentence_pairs": [
                     {
@@ -100,6 +129,9 @@ class AlignmentLink(BaseModel):
 
 class AlignmentGroup(BaseModel):
     type: AlignmentType
+    origin: AlignmentGroupOrigin
+    similarity: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
     source_indices: list[int]
     target_indices: list[int]
     source_tokens: list[str]

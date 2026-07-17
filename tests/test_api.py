@@ -81,9 +81,12 @@ def test_align_endpoint_returns_languages_and_grouped_links() -> None:
     assert body["source_language"] == "en"
     assert body["target_language"] == "zh-Hans"
     assert body["embedding_layer"] == 8
-    assert body["confidence_method"] == "bidirectional-softmax-margin-v1"
+    assert body["confidence_method"] == "bidirectional-margin-span-v2"
     assert body["sentence_alignments"][0]["alignment_groups"][0]["type"] == "one-to-many"
     assert body["sentence_alignments"][0]["alignment_groups"][0]["target_indices"] == [0, 1]
+    assert body["sentence_alignments"][0]["alignment_groups"][0]["origin"] == "model"
+    assert 0.0 <= body["sentence_alignments"][0]["alignment_groups"][0]["similarity"] <= 1.0
+    assert 0.0 <= body["sentence_alignments"][0]["alignment_groups"][0]["confidence"] <= 1.0
     links = body["sentence_alignments"][0]["links"]
     assert all(0.0 <= link["similarity"] <= 1.0 for link in links)
     assert all(0.0 <= link["confidence"] <= 1.0 for link in links)

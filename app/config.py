@@ -40,7 +40,7 @@ def _read_float(name: str, default: float) -> float:
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str = "Multilingual Word Alignment API"
-    app_version: str = "0.2.0"
+    app_version: str = "0.3.0"
     model: str = "xlmr"
     token_type: str = "word"
     layer: int = 8

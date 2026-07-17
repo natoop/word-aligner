@@ -25,15 +25,34 @@ def _whitespace_tokenize(value: str):
         yield match.group(), match.start(), match.end()
 
 
+def _direction_phrase_tokenize(value: str):
+    for match in re.finditer(r"北方|南方|的|[，。]", value):
+        yield match.group(), match.start(), match.end()
+
+
+def _machine_translation_tokenize(value: str):
+    for match in re.finditer(r"这是|一个|机器翻译|示例|。", value):
+        yield match.group(), match.start(), match.end()
+
+
+def _atomic_link_tokenize(value: str):
+    for match in re.finditer(r"原子|链接|只|保留|和", value):
+        yield match.group(), match.start(), match.end()
+
+
 class StubBackend:
     def __init__(
         self,
         links: set[tuple[int, int]],
         additional_alignments: dict[str, set[tuple[int, int]]] | None = None,
         similarities: list[list[float]] | None = None,
+        source_embeddings: list[list[float]] | None = None,
+        target_embeddings: list[list[float]] | None = None,
     ) -> None:
         self._alignments = {"itermax": links, **(additional_alignments or {})}
         self._similarities = similarities
+        self._source_embeddings = source_embeddings
+        self._target_embeddings = target_embeddings
         self.calls = 0
 
     def align_tokens(self, source_tokens: list[str], target_tokens: list[str]) -> TokenEmbeddingAlignment:
@@ -52,6 +71,12 @@ class StubBackend:
             similarities=_freeze(matrix),
             source_to_target_probabilities=_freeze(source_probabilities),
             target_to_source_probabilities=_freeze(target_probabilities),
+            source_embeddings=(
+                np.asarray(self._source_embeddings, dtype=float) if self._source_embeddings is not None else None
+            ),
+            target_embeddings=(
+                np.asarray(self._target_embeddings, dtype=float) if self._target_embeddings is not None else None
+            ),
         )
 
 
@@ -275,6 +300,250 @@ def test_conservative_repair_adds_a_nearby_mwmf_link_when_both_tokens_are_unalig
     assert result.target_tokens[repaired_link.target_index].text == "آلة"
     assert repaired_link.similarity == 0.9
     assert repaired_link.confidence >= request.repair.min_confidence
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+@pytest.mark.parametrize("min_confidence", [0.35, 0.99])
+def test_conservative_repair_collapses_ambiguous_low_coverage_clauses_into_phrase_groups(
+    min_confidence: float,
+) -> None:
+    itermax_links = {
+        (0, 0),
+        (1, 4),
+        (2, 5),
+        (3, 6),
+        (4, 9),
+        (6, 12),
+        (7, 13),
+    }
+    backend = StubBackend(itermax_links, {"mwmf": itermax_links | {(5, 7)}})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_direction_phrase_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "zh-Hans",
+            "target_language": "en",
+            "method": "itermax",
+            "repair": {
+                "enabled": True,
+                "strategy": "conservative",
+                "max_position_distance": 0.35,
+                "min_similarity": 0.45,
+                "min_confidence": min_confidence,
+            },
+            "sentence_pairs": [
+                {
+                    "id": "sentence-1",
+                    "source": "北方的北方，南方的南方。",
+                    "target": "The far north of the North, the far south of the South.",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index) for link in result.links] == [(3, 6), (7, 13)]
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert [group.type for group in refined_groups] == ["many-to-many", "many-to-many"]
+    assert [group.source_indices for group in refined_groups] == [[0, 1, 2], [4, 5, 6]]
+    assert [group.target_indices for group in refined_groups] == [
+        [0, 1, 2, 3, 4, 5],
+        [7, 8, 9, 10, 11, 12],
+    ]
+    assert all(group.links == [] for group in refined_groups)
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_conservative_repair_segments_a_long_clause_into_local_monotonic_spans() -> None:
+    itermax_links = {(0, 0), (1, 1), (4, 2), (5, 3), (6, 4)}
+    backend = StubBackend(
+        itermax_links,
+        {"mwmf": itermax_links},
+        similarities=[
+            [0.95, 0.80, 0.70, 0.60, 0.50],
+            [0.90, 0.91, 0.70, 0.60, 0.50],
+            [0.80, 0.90, 0.70, 0.60, 0.50],
+            [0.70, 0.70, 0.92, 0.70, 0.50],
+            [0.70, 0.70, 0.94, 0.70, 0.50],
+            [0.70, 0.70, 0.70, 0.92, 0.50],
+            [0.50, 0.50, 0.50, 0.50, 0.98],
+        ],
+        source_embeddings=[[1.0, 0.0]] * 7,
+        target_embeddings=[[1.0, 0.0]] * 5,
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_machine_translation_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "method": "itermax",
+            "repair": {
+                "enabled": True,
+                "strategy": "conservative",
+                "max_source_span": 3,
+                "max_target_span": 6,
+                "min_span_coverage": 0.75,
+            },
+            "sentence_pairs": [
+                {
+                    "id": "sentence-1",
+                    "source": "This is a machine translation example.",
+                    "target": "这是一个机器翻译示例。",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index) for link in result.links] == [(5, 3), (6, 4)]
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert [group.type for group in refined_groups] == ["many-to-one", "one-to-one", "many-to-one"]
+    assert [group.source_indices for group in refined_groups] == [[0, 1], [2], [3, 4]]
+    assert [group.target_indices for group in refined_groups] == [[0], [1], [2]]
+    assert all(group.links == [] for group in refined_groups)
+    assert result.alignment_groups[-2].source_tokens == ["example"]
+    assert result.alignment_groups[-2].target_tokens == ["示例"]
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_local_monotonic_span_segmentation_is_symmetric() -> None:
+    itermax_links = {(0, 0), (1, 1), (2, 4), (3, 5), (4, 6)}
+    similarities = np.asarray(
+        [
+            [0.95, 0.80, 0.70, 0.60, 0.50],
+            [0.90, 0.91, 0.70, 0.60, 0.50],
+            [0.80, 0.90, 0.70, 0.60, 0.50],
+            [0.70, 0.70, 0.92, 0.70, 0.50],
+            [0.70, 0.70, 0.94, 0.70, 0.50],
+            [0.70, 0.70, 0.70, 0.92, 0.50],
+            [0.50, 0.50, 0.50, 0.50, 0.98],
+        ]
+    ).transpose()
+    backend = StubBackend(
+        itermax_links,
+        {"mwmf": itermax_links},
+        similarities=similarities.tolist(),
+        source_embeddings=[[1.0, 0.0]] * 5,
+        target_embeddings=[[1.0, 0.0]] * 7,
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_machine_translation_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "zh-Hans",
+            "target_language": "en",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [
+                {
+                    "source": "这是一个机器翻译示例。",
+                    "target": "This is a machine translation example.",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index) for link in result.links] == [(3, 5), (4, 6)]
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert [group.source_indices for group in refined_groups] == [[0], [1], [2]]
+    assert [group.target_indices for group in refined_groups] == [[0, 1], [2], [3, 4]]
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_conservative_repair_groups_a_local_crossing_and_rule_aligns_arrow_expressions() -> None:
+    itermax_links = {(0, 3), (1, 2), (2, 0), (3, 1), (4, 6), (5, 5), (6, 4)}
+    backend = StubBackend(itermax_links, {"mwmf": itermax_links})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_atomic_link_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "zh-Hans",
+            "target_language": "en",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [
+                {
+                    "source": "原子链接只保留 5→3 和 6→4",
+                    "target": "Only retain atomic links 5→3 and 6→4",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [token.text for token in result.source_tokens] == [
+        "原子",
+        "链接",
+        "只",
+        "保留",
+        "5→3",
+        "和",
+        "6→4",
+    ]
+    assert [(link.source_index, link.target_index, link.origin) for link in result.links] == [
+        (2, 0, "model"),
+        (3, 1, "model"),
+        (4, 4, "rule"),
+        (5, 5, "model"),
+        (6, 6, "rule"),
+    ]
+    refined_group = next(group for group in result.alignment_groups if group.origin == "refined")
+    assert refined_group.source_indices == [0, 1]
+    assert refined_group.target_indices == [2, 3]
+    assert refined_group.source_tokens == ["原子", "链接"]
+    assert refined_group.target_tokens == ["atomic", "links"]
+    assert refined_group.links == []
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_span_aware_repair_expands_one_side_when_the_pooled_embedding_score_improves() -> None:
+    links = {(0, 0), (1, 2)}
+    backend = StubBackend(
+        links,
+        {"mwmf": links},
+        similarities=[[0.85, 0.8, 0.1], [0.1, 0.1, 0.95]],
+        source_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        target_embeddings=[[1.0, 1.0], [1.0, -1.0], [0.0, 1.0]],
+    )
+    service = AlignmentService(Settings(), backend_factory=lambda: backend)
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "en",
+            "repair": {"strategy": "span-aware"},
+            "sentence_pairs": [{"source": "NewYork.", "target": "New York."}],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    refined_group = next(group for group in result.alignment_groups if group.origin == "refined")
+    assert refined_group.type == "one-to-many"
+    assert refined_group.source_indices == [0]
+    assert refined_group.target_indices == [0, 1]
+    assert [(link.source_index, link.target_index) for link in refined_group.links] == [(0, 0)]
+    assert refined_group.similarity == 1.0
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
 

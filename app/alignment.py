@@ -16,6 +16,7 @@ from app.config import Settings
 from app.model_cache import configure_huggingface_access
 from app.schemas import (
     AlignmentGroup,
+    AlignmentGroupOrigin,
     AlignmentLink,
     AlignmentLinkOrigin,
     AlignmentRequest,
@@ -23,12 +24,13 @@ from app.schemas import (
     SentenceAlignment,
     Token,
 )
+from app.span_refinement import RefinedSpan, refine_alignment_spans
 from app.tokenization import WordTokenizer
 
 RawLink = tuple[int, int]
 RawAlignment = Mapping[str, Iterable[RawLink]]
 ScoreMatrix = tuple[tuple[float, ...], ...]
-CONFIDENCE_METHOD = "bidirectional-softmax-margin-v1"
+CONFIDENCE_METHOD = "bidirectional-margin-span-v2"
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,9 @@ class TokenEmbeddingAlignment:
     similarities: ScoreMatrix
     source_to_target_probabilities: ScoreMatrix
     target_to_source_probabilities: ScoreMatrix
+    source_embeddings: np.ndarray | None = None
+    target_embeddings: np.ndarray | None = None
+    relative_similarities: ScoreMatrix | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,9 +54,7 @@ class LinkScore:
 
 
 class WordAlignerBackend(Protocol):
-    def align_tokens(
-        self, source_tokens: list[str], target_tokens: list[str]
-    ) -> TokenEmbeddingAlignment: ...
+    def align_tokens(self, source_tokens: list[str], target_tokens: list[str]) -> TokenEmbeddingAlignment: ...
 
 
 class AlignmentModelError(RuntimeError):
@@ -104,9 +107,7 @@ class SimAlignBackend:
         )
         self._confidence_temperature = settings.confidence_temperature
 
-    def align_tokens(
-        self, source_tokens: list[str], target_tokens: list[str]
-    ) -> TokenEmbeddingAlignment:
+    def align_tokens(self, source_tokens: list[str], target_tokens: list[str]) -> TokenEmbeddingAlignment:
         if not source_tokens or not target_tokens:
             empty_matrix: ScoreMatrix = tuple(tuple() for _ in source_tokens)
             return TokenEmbeddingAlignment(
@@ -114,6 +115,7 @@ class SimAlignBackend:
                 similarities=empty_matrix,
                 source_to_target_probabilities=empty_matrix,
                 target_to_source_probabilities=empty_matrix,
+                relative_similarities=empty_matrix,
             )
 
         tokenizer = self._aligner.embed_loader.tokenizer
@@ -126,9 +128,7 @@ class SimAlignBackend:
 
         vectors = self._aligner.embed_loader.get_embed_list([source_tokens, target_tokens]).cpu().detach().numpy()
         if any(vectors.shape[1] < len(subwords) for subwords in subword_lists):
-            raise ValueError(
-                "The tokenized sentence exceeds the embedding model's maximum sequence length"
-            )
+            raise ValueError("The tokenized sentence exceeds the embedding model's maximum sequence length")
 
         subword_vectors = [vectors[side, : len(subword_lists[side])] for side in (0, 1)]
         source_word_vectors, target_word_vectors = self._aligner.average_embeds_over_words(
@@ -139,6 +139,10 @@ class SimAlignBackend:
             self._aligner.get_similarity(source_word_vectors, target_word_vectors),
             0.0,
             1.0,
+        )
+        relative_similarity_matrix = _relative_similarity_matrix(
+            similarity_matrix,
+            temperature=self._confidence_temperature,
         )
 
         forward, reverse = self._aligner.get_alignment_matrix(similarity_matrix)
@@ -160,12 +164,12 @@ class SimAlignBackend:
             for method in self._aligner.matching_methods
         }
         source_probabilities = _softmax_matrix(
-            similarity_matrix,
+            relative_similarity_matrix,
             axis=1,
             temperature=self._confidence_temperature,
         )
         target_probabilities = _softmax_matrix(
-            similarity_matrix,
+            relative_similarity_matrix,
             axis=0,
             temperature=self._confidence_temperature,
         )
@@ -174,6 +178,9 @@ class SimAlignBackend:
             similarities=_freeze_matrix(similarity_matrix),
             source_to_target_probabilities=_freeze_matrix(source_probabilities),
             target_to_source_probabilities=_freeze_matrix(target_probabilities),
+            source_embeddings=_freeze_embeddings(source_word_vectors),
+            target_embeddings=_freeze_embeddings(target_word_vectors),
+            relative_similarities=_freeze_matrix(relative_similarity_matrix),
         )
 
 
@@ -195,8 +202,30 @@ def _softmax_matrix(matrix: np.ndarray, *, axis: int, temperature: float) -> np.
     return exponentials / exponentials.sum(axis=axis, keepdims=True)
 
 
+def _relative_similarity_matrix(matrix: np.ndarray, *, temperature: float) -> np.ndarray:
+    """Convert absolute cosine scores into CSLS-style local evidence."""
+
+    if matrix.size == 0:
+        return matrix.copy()
+    row_k = min(3, matrix.shape[1])
+    column_k = min(3, matrix.shape[0])
+    row_neighborhood = np.partition(matrix, matrix.shape[1] - row_k, axis=1)[:, -row_k:]
+    column_neighborhood = np.partition(matrix, matrix.shape[0] - column_k, axis=0)[-column_k:, :]
+    row_baseline = row_neighborhood.mean(axis=1, keepdims=True)
+    column_baseline = column_neighborhood.mean(axis=0, keepdims=True)
+    relative = 2.0 * matrix - row_baseline - column_baseline
+    scaled = np.clip(relative / temperature, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-scaled))
+
+
 def _freeze_matrix(matrix: np.ndarray) -> ScoreMatrix:
     return tuple(tuple(float(value) for value in row) for row in matrix)
+
+
+def _freeze_embeddings(vectors: object) -> np.ndarray:
+    embeddings = np.asarray(vectors, dtype=float).copy()
+    embeddings.setflags(write=False)
+    return embeddings
 
 
 def _ensure_device_available(device: str, cuda_available: bool) -> None:
@@ -298,11 +327,32 @@ class AlignmentService:
                 links.update(repaired_link_scores)
                 link_scores.update(repaired_link_scores)
 
-            link_origins: dict[tuple[int, int], AlignmentLinkOrigin] = {
-                link: "model" for link in links
-            }
+            link_origins: dict[tuple[int, int], AlignmentLinkOrigin] = {link: "model" for link in links}
             link_origins.update({link: "rule" for link in rule_links})
             link_origins.update({link: "repaired" for link in repaired_link_scores})
+
+            refined_spans: Sequence[RefinedSpan] = ()
+            grouped_links: set[tuple[int, int]] = set()
+            if request.repair is not None and request.repair.enabled:
+                span_refinement = refine_alignment_spans(
+                    source_tokens=source_tokens,
+                    target_tokens=target_tokens,
+                    links=links,
+                    similarities=embedding_result.similarities,
+                    relative_similarities=(embedding_result.relative_similarities or embedding_result.similarities),
+                    link_confidences={link: score.confidence for link, score in link_scores.items()},
+                    strategy=request.repair.strategy,
+                    max_source_span=request.repair.max_source_span,
+                    max_target_span=request.repair.max_target_span,
+                    min_score_gain=request.repair.min_score_gain,
+                    min_span_coverage=request.repair.min_span_coverage,
+                    source_embeddings=embedding_result.source_embeddings,
+                    target_embeddings=embedding_result.target_embeddings,
+                )
+                links = set(span_refinement.links)
+                refined_spans = span_refinement.groups
+                grouped_links = set(span_refinement.grouped_links)
+
             sentence_alignments.append(
                 _build_sentence_alignment(
                     pair_index=pair_index,
@@ -314,6 +364,8 @@ class AlignmentService:
                     links=links,
                     link_origins=link_origins,
                     link_scores=link_scores,
+                    refined_spans=refined_spans,
+                    grouped_links=grouped_links,
                 )
             )
 
@@ -366,16 +418,31 @@ def _validate_embedding_result(
         "source_to_target_probabilities": result.source_to_target_probabilities,
         "target_to_source_probabilities": result.target_to_source_probabilities,
     }
+    if result.relative_similarities is not None:
+        matrices["relative_similarities"] = result.relative_similarities
     for name, matrix in matrices.items():
         if len(matrix) != source_count or any(len(row) != target_count for row in matrix):
-            raise ValueError(
-                f"Backend {name} matrix has an invalid shape; "
-                f"expected {source_count}x{target_count}"
-            )
+            raise ValueError(f"Backend {name} matrix has an invalid shape; expected {source_count}x{target_count}")
         for row in matrix:
             for value in row:
                 if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                     raise ValueError(f"Backend {name} matrix contains a score outside 0..1")
+
+    embeddings = {
+        "source_embeddings": (result.source_embeddings, source_count),
+        "target_embeddings": (result.target_embeddings, target_count),
+    }
+    embedding_dimensions: set[int] = set()
+    for name, (values, expected_count) in embeddings.items():
+        if values is None:
+            continue
+        if values.ndim != 2 or values.shape[0] != expected_count:
+            raise ValueError(f"Backend {name} has an invalid shape; expected {expected_count} word vectors")
+        if not np.isfinite(values).all():
+            raise ValueError(f"Backend {name} contains a non-finite value")
+        embedding_dimensions.add(int(values.shape[1]))
+    if len(embedding_dimensions) > 1:
+        raise ValueError("Backend source and target embeddings use different dimensions")
 
 
 def _score_model_link(
@@ -385,35 +452,30 @@ def _score_model_link(
 ) -> LinkScore:
     source_index, target_index = link
     similarity = result.similarities[source_index][target_index]
+    evidence_matrix = result.relative_similarities or result.similarities
     source_probability = result.source_to_target_probabilities[source_index][target_index]
     target_probability = result.target_to_source_probabilities[source_index][target_index]
-    directional_evidence = math.sqrt(source_probability * target_probability) * similarity
+    directional_evidence = math.sqrt(source_probability * target_probability)
 
     source_margin = _candidate_margin(
-        result.similarities[source_index],
+        evidence_matrix[source_index],
         selected_index=target_index,
     )
-    target_column = tuple(row[target_index] for row in result.similarities)
+    target_column = tuple(row[target_index] for row in evidence_matrix)
     target_margin = _candidate_margin(target_column, selected_index=source_index)
     margin = (source_margin + target_margin) / 2.0
 
     enabled_methods = tuple(normalized_alignments.values())
     method_agreement = (
-        sum(link in method_links for method_links in enabled_methods) / len(enabled_methods)
-        if enabled_methods
-        else 0.0
+        sum(link in method_links for method_links in enabled_methods) / len(enabled_methods) if enabled_methods else 0.0
     )
-    mutual_best = (
-        math.isclose(similarity, max(result.similarities[source_index]), abs_tol=1e-12)
-        and math.isclose(similarity, max(target_column), abs_tol=1e-12)
+    span_consistency = _link_span_consistency(
+        link,
+        normalized_alignments,
+        source_count=len(result.similarities),
+        target_count=len(result.similarities[0]) if result.similarities else 0,
     )
-    confidence = (
-        0.45 * similarity
-        + 0.25 * directional_evidence
-        + 0.15 * margin
-        + 0.10 * method_agreement
-        + 0.05 * float(mutual_best)
-    )
+    confidence = 0.35 * directional_evidence + 0.30 * margin + 0.20 * method_agreement + 0.15 * span_consistency
     return LinkScore(
         similarity=_bounded_score(similarity),
         confidence=_bounded_score(confidence),
@@ -425,6 +487,39 @@ def _candidate_margin(scores: Sequence[float], *, selected_index: int) -> float:
     if not competitors:
         return 0.0
     return max(0.0, float(scores[selected_index]) - max(competitors))
+
+
+def _link_span_consistency(
+    link: tuple[int, int],
+    normalized_alignments: Mapping[str, set[tuple[int, int]]],
+    *,
+    source_count: int,
+    target_count: int,
+) -> float:
+    source_index, target_index = link
+    order_scores: list[float] = []
+    for method_links in normalized_alignments.values():
+        if link not in method_links:
+            continue
+        comparable_links = [
+            candidate
+            for candidate in method_links
+            if candidate != link and candidate[0] != source_index and candidate[1] != target_index
+        ]
+        if not comparable_links:
+            order_scores.append(0.5)
+            continue
+        concordant = sum(
+            (candidate_source - source_index) * (candidate_target - target_index) > 0
+            for candidate_source, candidate_target in comparable_links
+        )
+        order_scores.append(concordant / len(comparable_links))
+
+    order_consistency = sum(order_scores) / len(order_scores) if order_scores else 0.0
+    position_consistency = 1.0 - abs(
+        _relative_position(source_index, source_count) - _relative_position(target_index, target_count)
+    )
+    return _bounded_score(0.7 * order_consistency + 0.3 * position_consistency)
 
 
 def _bounded_score(value: float) -> float:
@@ -488,8 +583,7 @@ def _repair_unaligned_links(
             continue
 
         position_distance = abs(
-            _relative_position(source_index, len(source_tokens))
-            - _relative_position(target_index, len(target_tokens))
+            _relative_position(source_index, len(source_tokens)) - _relative_position(target_index, len(target_tokens))
         )
         if position_distance > max_position_distance:
             continue
@@ -504,9 +598,7 @@ def _repair_unaligned_links(
 
         position_score = _position_proximity(position_distance, max_position_distance)
         anchor_score = _anchor_consistency(source_index, target_index, base_links)
-        repaired_confidence = model_score.confidence * (
-            0.75 + 0.15 * position_score + 0.10 * anchor_score
-        )
+        repaired_confidence = model_score.confidence * (0.75 + 0.15 * position_score + 0.10 * anchor_score)
         repaired_score = LinkScore(
             similarity=model_score.similarity,
             confidence=_bounded_score(repaired_confidence),
@@ -554,26 +646,20 @@ def _anchor_consistency(
     previous_source_indices = [
         candidate_source for candidate_source, _ in base_links if candidate_source < source_index
     ]
-    next_source_indices = [
-        candidate_source for candidate_source, _ in base_links if candidate_source > source_index
-    ]
+    next_source_indices = [candidate_source for candidate_source, _ in base_links if candidate_source > source_index]
     checks: list[bool] = []
 
     if previous_source_indices:
         previous_source = max(previous_source_indices)
         previous_targets = [
-            candidate_target
-            for candidate_source, candidate_target in base_links
-            if candidate_source == previous_source
+            candidate_target for candidate_source, candidate_target in base_links if candidate_source == previous_source
         ]
         checks.append(target_index >= max(previous_targets))
 
     if next_source_indices:
         next_source = min(next_source_indices)
         next_targets = [
-            candidate_target
-            for candidate_source, candidate_target in base_links
-            if candidate_source == next_source
+            candidate_target for candidate_source, candidate_target in base_links if candidate_source == next_source
         ]
         checks.append(target_index <= min(next_targets))
 
@@ -603,17 +689,22 @@ def _build_sentence_alignment(
     links: set[tuple[int, int]],
     link_origins: Mapping[tuple[int, int], AlignmentLinkOrigin],
     link_scores: Mapping[tuple[int, int], LinkScore],
+    refined_spans: Sequence[RefinedSpan],
+    grouped_links: set[tuple[int, int]],
 ) -> SentenceAlignment:
     sorted_links = sorted(links)
     groups = _build_alignment_groups(
         source_tokens,
         target_tokens,
-        sorted_links,
+        [link for link in sorted_links if link not in grouped_links],
         link_origins,
         link_scores,
+        refined_spans,
     )
     aligned_source = {source_index for source_index, _ in sorted_links}
     aligned_target = {target_index for _, target_index in sorted_links}
+    aligned_source.update(source_index for span in refined_spans for source_index in span.source_indices)
+    aligned_target.update(target_index for span in refined_spans for target_index in span.target_indices)
 
     return SentenceAlignment(
         index=pair_index,
@@ -644,6 +735,7 @@ def _build_alignment_groups(
     links: list[tuple[int, int]],
     link_origins: Mapping[tuple[int, int], AlignmentLinkOrigin],
     link_scores: Mapping[tuple[int, int], LinkScore],
+    refined_spans: Sequence[RefinedSpan],
 ) -> list[AlignmentGroup]:
     adjacency: dict[tuple[str, int], set[tuple[str, int]]] = defaultdict(set)
     for source_index, target_index in links:
@@ -701,6 +793,9 @@ def _build_alignment_groups(
         groups.append(
             AlignmentGroup(
                 type=_classify_group(len(source_indices), len(target_indices)),
+                origin=_group_origin(component_links),
+                similarity=_mean_group_score(component_links, "similarity"),
+                confidence=_mean_group_score(component_links, "confidence"),
                 source_indices=source_indices,
                 target_indices=target_indices,
                 source_tokens=[source_tokens[index].text for index in source_indices],
@@ -708,7 +803,50 @@ def _build_alignment_groups(
                 links=component_links,
             )
         )
+    for span in refined_spans:
+        span_links = [
+            AlignmentLink(
+                source_index=source_index,
+                target_index=target_index,
+                origin=link_origins[(source_index, target_index)],
+                similarity=link_scores[(source_index, target_index)].similarity,
+                confidence=link_scores[(source_index, target_index)].confidence,
+            )
+            for source_index, target_index in span.links
+        ]
+        groups.append(
+            AlignmentGroup(
+                type=_classify_group(len(span.source_indices), len(span.target_indices)),
+                origin="refined",
+                similarity=span.similarity,
+                confidence=span.confidence,
+                source_indices=list(span.source_indices),
+                target_indices=list(span.target_indices),
+                source_tokens=[source_tokens[index].text for index in span.source_indices],
+                target_tokens=[target_tokens[index].text for index in span.target_indices],
+                links=span_links,
+            )
+        )
+    groups.sort(
+        key=lambda group: (
+            group.source_indices[0] if group.source_indices else len(source_tokens),
+            group.target_indices[0] if group.target_indices else len(target_tokens),
+        )
+    )
     return groups
+
+
+def _group_origin(links: Sequence[AlignmentLink]) -> AlignmentGroupOrigin:
+    origins = {link.origin for link in links}
+    if len(origins) == 1:
+        return next(iter(origins))
+    return "mixed"
+
+
+def _mean_group_score(links: Sequence[AlignmentLink], attribute: str) -> float:
+    if not links:
+        return 0.0
+    return _bounded_score(sum(float(getattr(link, attribute)) for link in links) / len(links))
 
 
 def _classify_group(source_count: int, target_count: int) -> str:

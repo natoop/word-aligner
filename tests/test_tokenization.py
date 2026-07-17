@@ -53,6 +53,17 @@ def test_chinese_tokenizer_does_not_split_a_placeholder() -> None:
     assert text[placeholder.start : placeholder.end] == "[[T1504_1]]"
 
 
+def test_tokenizer_preserves_index_arrow_expressions_as_protected_tokens() -> None:
+    text = "保留 5→3 和 6->4"
+    tokenizer = WordTokenizer(chinese_tokenize=_whitespace_tokenize)
+
+    tokens = tokenizer.tokenize(text, "zh-Hans")
+
+    assert [token.text for token in tokens] == ["保留", "5→3", "和", "6->4"]
+    assert [token.text for token in tokens if token.is_protected] == ["5→3", "6->4"]
+    assert [text[token.start : token.end] for token in tokens] == [token.text for token in tokens]
+
+
 def test_unicode_tokenizer_keeps_combining_marks_inside_indic_words() -> None:
     text = "मैं हिन्दी बोलता हूँ।"
 

@@ -9,7 +9,8 @@ from app.schemas import Token
 ChineseTokenize = Callable[[str], Iterable[tuple[str, int, int]]]
 
 _PROTECTED_SOURCE = (
-    r"\[\[[^\[\]\r\n]+\]\]"
+    r"\d+\s*(?:→|->)\s*\d+"
+    r"|\[\[[^\[\]\r\n]+\]\]"
     r"|\{\{[^{}\r\n]+\}\}"
     r"|\$\{[^{}\r\n]+\}"
     r"|</?[A-Za-z][^>\r\n]*>"
@@ -112,11 +113,7 @@ def _tokenize_unicode_fragment(text: str, start: int, end: int) -> list[tuple[st
                 if _is_word_continuation(text[cursor]):
                     cursor += 1
                     continue
-                if (
-                    text[cursor] in _WORD_JOINERS
-                    and cursor + 1 < end
-                    and _is_word_start(text[cursor + 1])
-                ):
+                if text[cursor] in _WORD_JOINERS and cursor + 1 < end and _is_word_start(text[cursor + 1]):
                     cursor += 1
                     continue
                 break
