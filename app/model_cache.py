@@ -5,7 +5,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _MODEL_ALIASES = {
     "bert": "bert-base-multilingual-cased",
     "xlmr": "xlm-roberta-base",

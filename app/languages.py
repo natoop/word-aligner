@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from app.schemas import SupportedLanguage
 
-
 # Languages exposed by this service have XLM-R coverage and usable word
 # boundaries with either the dedicated Chinese tokenizer or the Unicode
 # tokenizer used by the API. Languages such as Japanese and Thai require an

@@ -3,14 +3,20 @@ name: word-aligner
 services:
   api:
     image: word-aligner:latest
-    build: .
+    build:
+      context: .
+      args:
+        PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu128
+    gpus: all
     ports:
       - "8000:8000"
     environment:
       ALIGNER_MODEL: xlmr
-      ALIGNER_TOKEN_TYPE: bpe
+      ALIGNER_TOKEN_TYPE: word
+      ALIGNER_LAYER: "8"
       ALIGNER_MATCHING_METHODS: mai
-      ALIGNER_DEVICE: cpu
+      ALIGNER_CONFIDENCE_TEMPERATURE: "0.1"
+      ALIGNER_DEVICE: cuda
       ALIGNER_EAGER_LOAD: "true"
       HF_HOME: /models
       HF_MODEL_UPDATE_POLICY: if-missing
@@ -21,4 +27,5 @@ services:
 volumes:
   model-cache:
     # Reuse the existing cache so the project rename does not redownload XLM-R.
-    name: sentence-align_sentence-align-models
+    external: true
+    name: word-aligner-models

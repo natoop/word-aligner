@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/models
@@ -8,7 +10,7 @@ WORKDIR /app
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<3.0" \
+    && pip install --no-cache-dir --index-url "${PYTORCH_INDEX_URL}" "torch>=2.2,<3.0" \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app

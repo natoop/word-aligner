@@ -5,9 +5,16 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
-from app.alignment import AlignmentModelError, AlignmentService, SimAlignBackend, _ensure_device_available
+from app.alignment import (
+    AlignmentModelError,
+    AlignmentService,
+    SimAlignBackend,
+    TokenEmbeddingAlignment,
+    _ensure_device_available,
+)
 from app.config import Settings
 from app.schemas import AlignmentRequest
 from app.tokenization import WordTokenizer
@@ -23,13 +30,40 @@ class StubBackend:
         self,
         links: set[tuple[int, int]],
         additional_alignments: dict[str, set[tuple[int, int]]] | None = None,
+        similarities: list[list[float]] | None = None,
     ) -> None:
         self._alignments = {"itermax": links, **(additional_alignments or {})}
+        self._similarities = similarities
         self.calls = 0
 
-    def get_word_aligns(self, source_tokens: list[str], target_tokens: list[str]):
+    def align_tokens(self, source_tokens: list[str], target_tokens: list[str]) -> TokenEmbeddingAlignment:
         self.calls += 1
-        return self._alignments
+        if self._similarities is None:
+            matrix = np.full((len(source_tokens), len(target_tokens)), 0.1, dtype=float)
+            for source_index, target_index in set().union(*self._alignments.values()):
+                matrix[source_index, target_index] = 0.9
+        else:
+            matrix = np.asarray(self._similarities, dtype=float)
+
+        source_probabilities = _softmax(matrix, axis=1)
+        target_probabilities = _softmax(matrix, axis=0)
+        return TokenEmbeddingAlignment(
+            alignments=self._alignments,
+            similarities=_freeze(matrix),
+            source_to_target_probabilities=_freeze(source_probabilities),
+            target_to_source_probabilities=_freeze(target_probabilities),
+        )
+
+
+def _softmax(matrix: np.ndarray, *, axis: int) -> np.ndarray:
+    scaled = matrix / 0.1
+    scaled -= scaled.max(axis=axis, keepdims=True)
+    exponentials = np.exp(scaled)
+    return exponentials / exponentials.sum(axis=axis, keepdims=True)
+
+
+def _freeze(matrix: np.ndarray) -> tuple[tuple[float, ...], ...]:
+    return tuple(tuple(float(value) for value in row) for row in matrix)
 
 
 def _request(source: str, target: str) -> AlignmentRequest:
@@ -60,6 +94,8 @@ def test_service_groups_many_to_one_and_one_to_many_links() -> None:
     assert result.alignment_groups[1].target_tokens == ["非常", "喜欢"]
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
+    assert all(0.0 <= link.similarity <= 1.0 for link in result.links)
+    assert all(0.0 <= link.confidence <= 1.0 for link in result.links)
     assert backend.calls == 1
 
 
@@ -91,6 +127,8 @@ def test_exact_placeholder_alignment_overrides_neural_links() -> None:
     result = response.sentence_alignments[0]
     assert [(link.source_index, link.target_index) for link in result.links] == [(1, 1)]
     assert result.links[0].origin == "rule"
+    assert result.links[0].similarity == 1.0
+    assert result.links[0].confidence == 1.0
     assert result.alignment_groups[0].source_tokens == ["[[T1504_1]]"]
     assert result.alignment_groups[0].target_tokens == ["[[T1504_1]]"]
 
@@ -153,6 +191,60 @@ def test_backend_reports_missing_sentencepiece_dependency() -> None:
         SimAlignBackend(Settings(device="cpu"))
 
 
+def test_simalign_backend_reuses_one_embedding_inference_for_links_and_scores() -> None:
+    class FakeTensor:
+        def __init__(self, value: np.ndarray) -> None:
+            self._value = value
+            self.shape = value.shape
+
+        def cpu(self) -> FakeTensor:
+            return self
+
+        def detach(self) -> FakeTensor:
+            return self
+
+        def numpy(self) -> np.ndarray:
+            return self._value
+
+    class FakeEmbeddingLoader:
+        def __init__(self) -> None:
+            self.tokenizer = SimpleNamespace(tokenize=lambda value: [value], unk_token="[UNK]")
+            self.calls = 0
+
+        def get_embed_list(self, _: list[list[str]]) -> FakeTensor:
+            self.calls += 1
+            return FakeTensor(
+                np.asarray(
+                    [
+                        [[1.0, 0.0], [0.0, 1.0]],
+                        [[1.0, 0.0], [0.0, 1.0]],
+                    ]
+                )
+            )
+
+    embedding_loader = FakeEmbeddingLoader()
+    identity = np.eye(2)
+    fake_aligner = SimpleNamespace(
+        embed_loader=embedding_loader,
+        matching_methods=["inter", "mwmf", "itermax"],
+        average_embeds_over_words=lambda vectors, _: vectors,
+        get_similarity=lambda source, target: np.matmul(source, target.transpose()),
+        get_alignment_matrix=lambda _: (identity, identity),
+        get_max_weight_match=lambda _: identity,
+        iter_max=lambda _: identity,
+    )
+    backend = SimAlignBackend.__new__(SimAlignBackend)
+    backend._aligner = fake_aligner
+    backend._confidence_temperature = 0.1
+
+    result = backend.align_tokens(["one", "two"], ["一", "二"])
+
+    assert embedding_loader.calls == 1
+    assert result.alignments["itermax"] == ((0, 0), (1, 1))
+    assert result.similarities == ((1.0, 0.0), (0.0, 1.0))
+    assert all(sum(row) == pytest.approx(1.0) for row in result.source_to_target_probabilities)
+
+
 def test_conservative_repair_adds_a_nearby_mwmf_link_when_both_tokens_are_unaligned() -> None:
     itermax_links = {(0, 0), (1, 2), (2, 2), (4, 2), (5, 1), (6, 4)}
     backend = StubBackend(itermax_links, {"mwmf": itermax_links | {(3, 3)}})
@@ -181,6 +273,8 @@ def test_conservative_repair_adds_a_nearby_mwmf_link_when_both_tokens_are_unalig
     repaired_link = next(link for link in result.links if link.origin == "repaired")
     assert result.source_tokens[repaired_link.source_index].text == "machine"
     assert result.target_tokens[repaired_link.target_index].text == "آلة"
+    assert repaired_link.similarity == 0.9
+    assert repaired_link.confidence >= request.repair.min_confidence
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
 
@@ -220,3 +314,67 @@ def test_conservative_repair_does_not_attach_to_an_already_aligned_target() -> N
 
     assert [(link.source_index, link.target_index, link.origin) for link in result.links] == [(0, 0, "model")]
     assert result.unaligned_source_indices == [1]
+
+
+def test_conservative_repair_rejects_a_low_similarity_candidate() -> None:
+    backend = StubBackend(
+        {(0, 0)},
+        {"mwmf": {(0, 0), (1, 1)}},
+        similarities=[[0.9, 0.1], [0.1, 0.3]],
+    )
+    service = AlignmentService(Settings(), backend_factory=lambda: backend)
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "en",
+            "repair": {"min_similarity": 0.45, "min_confidence": 0.0},
+            "sentence_pairs": [{"source": "hello extra", "target": "hello omitted"}],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert all(link.origin != "repaired" for link in result.links)
+    assert result.unaligned_source_indices == [1]
+    assert result.unaligned_target_indices == [1]
+
+
+def test_conservative_repair_rejects_a_candidate_below_the_confidence_threshold() -> None:
+    backend = StubBackend(
+        {(0, 0)},
+        {"mwmf": {(0, 0), (1, 1)}},
+        similarities=[[0.9, 0.1], [0.1, 0.9]],
+    )
+    service = AlignmentService(Settings(), backend_factory=lambda: backend)
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "en",
+            "repair": {"min_similarity": 0.0, "min_confidence": 0.99},
+            "sentence_pairs": [{"source": "hello extra", "target": "hello candidate"}],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert all(link.origin != "repaired" for link in result.links)
+    assert result.unaligned_source_indices == [1]
+    assert result.unaligned_target_indices == [1]
+
+
+def test_confidence_is_higher_for_a_clear_mutual_match_than_an_ambiguous_match() -> None:
+    backend = StubBackend(
+        {(0, 0), (1, 1)},
+        {"inter": {(0, 0)}, "mwmf": {(0, 0), (1, 1)}},
+        similarities=[[0.95, 0.1], [0.7, 0.7]],
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_whitespace_tokenize),
+        backend_factory=lambda: backend,
+    )
+
+    result = service.align(_request("clear ambiguous", "明确 模糊")).sentence_alignments[0]
+    scores = {(link.source_index, link.target_index): link.confidence for link in result.links}
+
+    assert scores[(0, 0)] > scores[(1, 1)]

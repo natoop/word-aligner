@@ -4,8 +4,9 @@ import asyncio
 import re
 
 import httpx
+import numpy as np
 
-from app.alignment import AlignmentService
+from app.alignment import AlignmentService, TokenEmbeddingAlignment
 from app.config import Settings
 from app.main import create_app
 from app.tokenization import WordTokenizer
@@ -17,8 +18,27 @@ def _whitespace_tokenize(value: str):
 
 
 class StubBackend:
-    def get_word_aligns(self, source_tokens: list[str], target_tokens: list[str]):
-        return {"itermax": {(0, 0), (0, 1)}}
+    def align_tokens(self, source_tokens: list[str], target_tokens: list[str]) -> TokenEmbeddingAlignment:
+        similarities = np.asarray([[0.9, 0.8]], dtype=float)
+        source_probabilities = _softmax(similarities, axis=1)
+        target_probabilities = _softmax(similarities, axis=0)
+        return TokenEmbeddingAlignment(
+            alignments={"itermax": {(0, 0), (0, 1)}},
+            similarities=_freeze(similarities),
+            source_to_target_probabilities=_freeze(source_probabilities),
+            target_to_source_probabilities=_freeze(target_probabilities),
+        )
+
+
+def _softmax(matrix: np.ndarray, *, axis: int) -> np.ndarray:
+    scaled = matrix / 0.1
+    scaled -= scaled.max(axis=axis, keepdims=True)
+    exponentials = np.exp(scaled)
+    return exponentials / exponentials.sum(axis=axis, keepdims=True)
+
+
+def _freeze(matrix: np.ndarray) -> tuple[tuple[float, ...], ...]:
+    return tuple(tuple(float(value) for value in row) for row in matrix)
 
 
 def _app():
@@ -60,8 +80,13 @@ def test_align_endpoint_returns_languages_and_grouped_links() -> None:
     body = response.json()
     assert body["source_language"] == "en"
     assert body["target_language"] == "zh-Hans"
+    assert body["embedding_layer"] == 8
+    assert body["confidence_method"] == "bidirectional-softmax-margin-v1"
     assert body["sentence_alignments"][0]["alignment_groups"][0]["type"] == "one-to-many"
     assert body["sentence_alignments"][0]["alignment_groups"][0]["target_indices"] == [0, 1]
+    links = body["sentence_alignments"][0]["links"]
+    assert all(0.0 <= link["similarity"] <= 1.0 for link in links)
+    assert all(0.0 <= link["confidence"] <= 1.0 for link in links)
 
 
 def test_align_endpoint_rejects_an_invalid_language_code() -> None:
@@ -89,6 +114,23 @@ def test_align_endpoint_rejects_an_invalid_repair_distance() -> None:
                 "source_language": "en",
                 "target_language": "zh-Hans",
                 "repair": {"max_position_distance": 1.1},
+                "sentence_pairs": [{"source": "hello", "target": "你好"}],
+            },
+        )
+    )
+
+    assert response.status_code == 422
+
+
+def test_align_endpoint_rejects_an_invalid_repair_confidence() -> None:
+    response = asyncio.run(
+        _request(
+            "POST",
+            "/api/v1/align",
+            json={
+                "source_language": "en",
+                "target_language": "zh-Hans",
+                "repair": {"min_confidence": -0.1},
                 "sentence_pairs": [{"source": "hello", "target": "你好"}],
             },
         )

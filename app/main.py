@@ -32,8 +32,8 @@ def create_app(
         title=resolved_settings.app_name,
         version=resolved_settings.app_version,
         description=(
-            "Align words in translated sentence pairs with SimAlign. "
-            "Alignment groups explicitly represent one-to-many and many-to-one relations."
+            "Align translated sentence pairs with contextual token embeddings. "
+            "Each link includes semantic similarity and an estimated confidence score."
         ),
         lifespan=lifespan,
     )

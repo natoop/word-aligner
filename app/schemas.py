@@ -20,6 +20,7 @@ NonEmptyText = Annotated[
 AlignmentMethod = Literal["itermax", "inter", "mwmf"]
 AlignmentType = Literal["one-to-one", "one-to-many", "many-to-one", "many-to-many"]
 AlignmentLinkOrigin = Literal["model", "rule", "repaired"]
+ConfidenceMethod = Literal["bidirectional-softmax-margin-v1"]
 WordTokenizerType = Literal["unicode-regex", "jieba"]
 
 
@@ -44,6 +45,8 @@ class RepairOptions(BaseModel):
     enabled: bool = True
     strategy: Literal["conservative"] = "conservative"
     max_position_distance: float = Field(default=0.35, ge=0.0, le=1.0)
+    min_similarity: float = Field(default=0.45, ge=0.0, le=1.0)
+    min_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
 
 
 class AlignmentRequest(BaseModel):
@@ -58,6 +61,8 @@ class AlignmentRequest(BaseModel):
                     "enabled": True,
                     "strategy": "conservative",
                     "max_position_distance": 0.35,
+                    "min_similarity": 0.45,
+                    "min_confidence": 0.35,
                 },
                 "sentence_pairs": [
                     {
@@ -89,6 +94,8 @@ class AlignmentLink(BaseModel):
     source_index: int
     target_index: int
     origin: AlignmentLinkOrigin = "model"
+    similarity: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class AlignmentGroup(BaseModel):
@@ -117,7 +124,9 @@ class AlignmentResponse(BaseModel):
     source_language: str
     target_language: str
     model: str
+    embedding_layer: int
     method: AlignmentMethod
+    confidence_method: ConfidenceMethod
     sentence_alignments: list[SentenceAlignment]
 
 
