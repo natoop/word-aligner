@@ -40,6 +40,16 @@ def _atomic_link_tokenize(value: str):
         yield match.group(), match.start(), match.end()
 
 
+def _date_tokenize(value: str):
+    for match in re.finditer(r"2025|年|2|月", value):
+        yield match.group(), match.start(), match.end()
+
+
+def _palm_ingredients_tokenize(value: str):
+    for match in re.finditer(r"棕榈油|及其|衍生|成分|必须|获得|RSPO|认证", value):
+        yield match.group(), match.start(), match.end()
+
+
 class StubBackend:
     def __init__(
         self,
@@ -513,6 +523,149 @@ def test_conservative_repair_groups_a_local_crossing_and_rule_aligns_arrow_expre
     assert refined_group.source_tokens == ["原子", "链接"]
     assert refined_group.target_tokens == ["atomic", "links"]
     assert refined_group.links == []
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+@pytest.mark.parametrize("month_text", ["Feb", "February"])
+def test_temporal_rules_align_reordered_english_and_chinese_year_month_spans(
+    month_text: str,
+) -> None:
+    backend = StubBackend({(0, 0)}, {"mwmf": {(0, 0)}})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_date_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [
+                {
+                    "source": f"{month_text} 2025",
+                    "target": "2025年2月",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index, link.origin) for link in result.links] == [
+        (0, 2, "rule"),
+        (0, 3, "rule"),
+        (1, 0, "rule"),
+        (1, 1, "rule"),
+    ]
+    assert [group.type for group in result.alignment_groups] == ["one-to-many", "one-to-many"]
+    assert [group.source_tokens for group in result.alignment_groups] == [[month_text], ["2025"]]
+    assert [group.target_tokens for group in result.alignment_groups] == [["2", "月"], ["2025", "年"]]
+    assert all(group.origin == "rule" for group in result.alignment_groups)
+    assert all(group.similarity == 1.0 and group.confidence == 1.0 for group in result.alignment_groups)
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_temporal_rules_are_symmetric_for_chinese_to_english_dates() -> None:
+    backend = StubBackend({(0, 0)}, {"mwmf": {(0, 0)}})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_date_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "zh-Hans",
+            "target_language": "en",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [{"source": "2025年2月", "target": "Feb 2025"}],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index, link.origin) for link in result.links] == [
+        (0, 1, "rule"),
+        (1, 1, "rule"),
+        (2, 0, "rule"),
+        (3, 0, "rule"),
+    ]
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_conservative_repair_builds_soft_anchor_islands_without_punctuation() -> None:
+    links = {(0, 0), (2, 1), (6, 2), (7, 3), (8, 4), (9, 5), (10, 6), (11, 7)}
+    similarities = np.full((12, 8), 0.85, dtype=float)
+    for source_index, target_index in links:
+        similarities[source_index, target_index] = 0.90
+    for source_index, target_index in {(0, 0), (2, 1), (8, 4), (10, 6), (11, 7)}:
+        similarities[source_index, target_index] = 0.99
+
+    source_embeddings = [
+        [1.0, 1.0, 0.0, 0.0],
+        [1.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, -5.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ]
+    target_embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ]
+    backend = StubBackend(
+        links,
+        {"mwmf": links},
+        similarities=similarities.tolist(),
+        source_embeddings=source_embeddings,
+        target_embeddings=target_embeddings,
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_palm_ingredients_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [
+                {
+                    "source": "Palm oil and ingredients derived from palm oils must be RSPO certified",
+                    "target": "棕榈油及其衍生成分必须获得RSPO认证",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index) for link in result.links] == [
+        (8, 4),
+        (9, 5),
+        (10, 6),
+        (11, 7),
+    ]
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert [group.source_indices for group in refined_groups] == [[0, 1], [2, 3, 4, 5, 6, 7]]
+    assert [group.target_indices for group in refined_groups] == [[0], [1, 2, 3]]
+    assert all(group.links == [] for group in refined_groups)
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
 

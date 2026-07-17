@@ -62,6 +62,22 @@ class _PartitionState:
     spans: tuple[SpanIndices, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SoftAnchor:
+    source_index: int
+    target_index: int
+    confidence: float
+    is_virtual: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _SoftRefinement:
+    links: frozenset[RawLink]
+    groups: tuple[RefinedSpan, ...]
+    claimed_source: frozenset[int]
+    claimed_target: frozenset[int]
+
+
 def refine_alignment_spans(
     *,
     source_tokens: Sequence[Token],
@@ -75,6 +91,7 @@ def refine_alignment_spans(
     max_target_span: int,
     min_score_gain: float,
     min_span_coverage: float,
+    min_anchor_confidence: float,
     source_embeddings: np.ndarray | None = None,
     target_embeddings: np.ndarray | None = None,
 ) -> SpanRefinement:
@@ -82,10 +99,38 @@ def refine_alignment_spans(
 
     current_links = set(links)
     regions = _extract_clause_regions(source_tokens, target_tokens, current_links)
-    groups: list[RefinedSpan] = []
+    soft_refinement = _SoftRefinement(
+        links=frozenset(current_links),
+        groups=(),
+        claimed_source=frozenset(),
+        claimed_target=frozenset(),
+    )
+    if not regions:
+        soft_refinement = _refine_soft_anchor_islands(
+            source_tokens=source_tokens,
+            target_tokens=target_tokens,
+            links=current_links,
+            similarities=similarities,
+            relative_similarities=relative_similarities,
+            link_confidences=link_confidences,
+            source_embeddings=source_embeddings,
+            target_embeddings=target_embeddings,
+            max_source_span=max_source_span,
+            max_target_span=max_target_span,
+            min_score_gain=min_score_gain,
+            min_anchor_confidence=min_anchor_confidence,
+        )
+        current_links = set(soft_refinement.links)
+        regions = _extract_clause_regions(source_tokens, target_tokens, current_links)
+
+    groups: list[RefinedSpan] = list(soft_refinement.groups)
     refined_regions: set[SpanIndices] = set()
 
     for region in regions:
+        if set(region.source_indices).intersection(soft_refinement.claimed_source):
+            continue
+        if set(region.target_indices).intersection(soft_refinement.claimed_target):
+            continue
         region_links = _links_inside_region(current_links, region)
         has_low_coverage = _should_refine_region(
             region,
@@ -126,7 +171,7 @@ def refine_alignment_spans(
             _make_refined_span(
                 source_indices,
                 target_indices,
-                region=region,
+                anchor_support=region.anchor_support,
                 region_links=region_links,
                 similarities=similarities,
                 relative_similarities=relative_similarities,
@@ -272,6 +317,432 @@ def _region_coverage(
         len(aligned_source) / len(region.source_indices),
         len(aligned_target) / len(region.target_indices),
     )
+
+
+def _refine_soft_anchor_islands(
+    *,
+    source_tokens: Sequence[Token],
+    target_tokens: Sequence[Token],
+    links: set[RawLink],
+    similarities: ScoreMatrix,
+    relative_similarities: ScoreMatrix,
+    link_confidences: Mapping[RawLink, float],
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+    min_anchor_confidence: float,
+) -> _SoftRefinement:
+    aligned_source = {source_index for source_index, _ in links}
+    aligned_target = {target_index for _, target_index in links}
+    if len(aligned_source) == len(source_tokens) and len(aligned_target) == len(target_tokens):
+        return _empty_soft_refinement(links)
+
+    anchor_threshold = max(0.45, min_anchor_confidence)
+    anchors = _select_soft_anchors(
+        source_tokens,
+        target_tokens,
+        links,
+        link_confidences,
+        threshold=anchor_threshold,
+    )
+    if len(anchors) < 2:
+        return _empty_soft_refinement(links)
+
+    bounded_anchors = (
+        _SoftAnchor(-1, -1, 1.0, True),
+        *anchors,
+        _SoftAnchor(len(source_tokens), len(target_tokens), 1.0, True),
+    )
+    current_links = set(links)
+    groups: list[RefinedSpan] = []
+    claimed_source: set[int] = set()
+    claimed_target: set[int] = set()
+    boundary_lock_confidence = max(0.55, anchor_threshold + 0.10)
+
+    for left, right in zip(bounded_anchors, bounded_anchors[1:], strict=False):
+        if _soft_anchor_is_claimed(left, claimed_source, claimed_target):
+            continue
+        if _soft_anchor_is_claimed(right, claimed_source, claimed_target):
+            continue
+
+        source_inner = tuple(range(left.source_index + 1, right.source_index))
+        target_inner = tuple(range(left.target_index + 1, right.target_index))
+        if not source_inner and not target_inner:
+            continue
+        if not all(_is_content_token(source_tokens[index]) for index in source_inner):
+            continue
+        if not all(_is_content_token(target_tokens[index]) for index in target_inner):
+            continue
+
+        internal_links = {link for link in current_links if link[0] in source_inner and link[1] in target_inner}
+        covered_source = {source_index for source_index, _ in internal_links}
+        covered_target = {target_index for _, target_index in internal_links}
+        if covered_source == set(source_inner) and covered_target == set(target_inner):
+            continue
+        if _has_links_crossing_soft_interval(
+            current_links,
+            source_inner,
+            target_inner,
+            left,
+            right,
+        ):
+            continue
+
+        selected_span: SpanIndices | None
+        if source_inner and not target_inner and not internal_links:
+            selected_span = _select_one_sided_gap_attachment(
+                source_inner=source_inner,
+                target_inner=(),
+                left=left,
+                right=right,
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+        elif target_inner and not source_inner and not internal_links:
+            selected_span = _select_one_sided_gap_attachment(
+                source_inner=(),
+                target_inner=target_inner,
+                left=left,
+                right=right,
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+        elif source_inner and target_inner:
+            selected_span = _select_composite_repair_island(
+                source_inner,
+                target_inner,
+                left=left,
+                right=right,
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+                boundary_lock_confidence=boundary_lock_confidence,
+            )
+        else:
+            selected_span = None
+        if selected_span is None:
+            continue
+
+        source_indices, target_indices = selected_span
+        groups.append(
+            _make_refined_span(
+                source_indices,
+                target_indices,
+                anchor_support=0.5,
+                region_links=current_links,
+                similarities=similarities,
+                relative_similarities=relative_similarities,
+                link_confidences=link_confidences,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+            )
+        )
+        claimed_source.update(source_indices)
+        claimed_target.update(target_indices)
+        current_links = {
+            link for link in current_links if link[0] not in claimed_source and link[1] not in claimed_target
+        }
+
+    return _SoftRefinement(
+        links=frozenset(current_links),
+        groups=tuple(groups),
+        claimed_source=frozenset(claimed_source),
+        claimed_target=frozenset(claimed_target),
+    )
+
+
+def _empty_soft_refinement(links: set[RawLink]) -> _SoftRefinement:
+    return _SoftRefinement(
+        links=frozenset(links),
+        groups=(),
+        claimed_source=frozenset(),
+        claimed_target=frozenset(),
+    )
+
+
+def _select_soft_anchors(
+    source_tokens: Sequence[Token],
+    target_tokens: Sequence[Token],
+    links: set[RawLink],
+    link_confidences: Mapping[RawLink, float],
+    *,
+    threshold: float,
+) -> tuple[_SoftAnchor, ...]:
+    source_degree: dict[int, int] = defaultdict(int)
+    target_degree: dict[int, int] = defaultdict(int)
+    for source_index, target_index in links:
+        source_degree[source_index] += 1
+        target_degree[target_index] += 1
+
+    candidates = [
+        _SoftAnchor(
+            source_index,
+            target_index,
+            link_confidences.get((source_index, target_index), 0.0),
+        )
+        for source_index, target_index in sorted(links)
+        if source_degree[source_index] == 1
+        and target_degree[target_index] == 1
+        and link_confidences.get((source_index, target_index), 0.0) >= threshold
+        and _is_content_token(source_tokens[source_index])
+        and _is_content_token(target_tokens[target_index])
+    ]
+    if not candidates:
+        return ()
+
+    best_paths: list[tuple[float, tuple[_SoftAnchor, ...]]] = []
+    for index, candidate in enumerate(candidates):
+        best_score = candidate.confidence
+        best_path = (candidate,)
+        for previous_score, previous_path in best_paths[:index]:
+            previous = previous_path[-1]
+            if previous.source_index >= candidate.source_index:
+                continue
+            if previous.target_index >= candidate.target_index:
+                continue
+            score = previous_score + candidate.confidence
+            path = previous_path + (candidate,)
+            if score > best_score or (math.isclose(score, best_score, abs_tol=1e-12) and len(path) > len(best_path)):
+                best_score = score
+                best_path = path
+        best_paths.append((best_score, best_path))
+    return max(best_paths, key=lambda item: (item[0], len(item[1])))[1]
+
+
+def _soft_anchor_is_claimed(
+    anchor: _SoftAnchor,
+    claimed_source: set[int],
+    claimed_target: set[int],
+) -> bool:
+    return not anchor.is_virtual and (anchor.source_index in claimed_source or anchor.target_index in claimed_target)
+
+
+def _has_links_crossing_soft_interval(
+    links: set[RawLink],
+    source_inner: tuple[int, ...],
+    target_inner: tuple[int, ...],
+    left: _SoftAnchor,
+    right: _SoftAnchor,
+) -> bool:
+    source_set = set(source_inner)
+    target_set = set(target_inner)
+    source_bounds = set(range(left.source_index, right.source_index + 1))
+    target_bounds = set(range(left.target_index, right.target_index + 1))
+    return any(
+        (source_index in source_set or target_index in target_set)
+        and (source_index not in source_bounds or target_index not in target_bounds)
+        for source_index, target_index in links
+    )
+
+
+def _select_one_sided_gap_attachment(
+    *,
+    source_inner: tuple[int, ...],
+    target_inner: tuple[int, ...],
+    left: _SoftAnchor,
+    right: _SoftAnchor,
+    similarities: ScoreMatrix,
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+) -> SpanIndices | None:
+    candidates: list[tuple[float, SpanIndices]] = []
+    if source_inner:
+        if not left.is_virtual:
+            _append_gap_candidate(
+                candidates,
+                source_indices=(left.source_index, *source_inner),
+                target_indices=(left.target_index,),
+                base_source=(left.source_index,),
+                base_target=(left.target_index,),
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+        if not right.is_virtual:
+            _append_gap_candidate(
+                candidates,
+                source_indices=(*source_inner, right.source_index),
+                target_indices=(right.target_index,),
+                base_source=(right.source_index,),
+                base_target=(right.target_index,),
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+    elif target_inner:
+        if not left.is_virtual:
+            _append_gap_candidate(
+                candidates,
+                source_indices=(left.source_index,),
+                target_indices=(left.target_index, *target_inner),
+                base_source=(left.source_index,),
+                base_target=(left.target_index,),
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+        if not right.is_virtual:
+            _append_gap_candidate(
+                candidates,
+                source_indices=(right.source_index,),
+                target_indices=(*target_inner, right.target_index),
+                base_source=(right.source_index,),
+                base_target=(right.target_index,),
+                similarities=similarities,
+                source_embeddings=source_embeddings,
+                target_embeddings=target_embeddings,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+            )
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _append_gap_candidate(
+    candidates: list[tuple[float, SpanIndices]],
+    *,
+    source_indices: tuple[int, ...],
+    target_indices: tuple[int, ...],
+    base_source: tuple[int, ...],
+    base_target: tuple[int, ...],
+    similarities: ScoreMatrix,
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+) -> None:
+    if len(source_indices) > max_source_span or len(target_indices) > max_target_span:
+        return
+    base_score = _span_similarity(
+        base_source,
+        base_target,
+        similarities,
+        source_embeddings,
+        target_embeddings,
+    )
+    expanded_score = _span_similarity(
+        source_indices,
+        target_indices,
+        similarities,
+        source_embeddings,
+        target_embeddings,
+    )
+    if _headroom_normalized_gain(expanded_score, base_score) >= min_score_gain:
+        candidates.append((expanded_score, (source_indices, target_indices)))
+
+
+def _select_composite_repair_island(
+    source_inner: tuple[int, ...],
+    target_inner: tuple[int, ...],
+    *,
+    left: _SoftAnchor,
+    right: _SoftAnchor,
+    similarities: ScoreMatrix,
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+    boundary_lock_confidence: float,
+) -> SpanIndices | None:
+    max_composite_source = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_source_span * 2)
+    max_composite_target = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_target_span * 2)
+    if len(source_inner) > max_composite_source or len(target_inner) > max_composite_target:
+        return None
+
+    base_score = _span_similarity(
+        source_inner,
+        target_inner,
+        similarities,
+        source_embeddings,
+        target_embeddings,
+    )
+    candidates: list[tuple[float, SpanIndices]] = [(base_score, (source_inner, target_inner))]
+    if not left.is_virtual and left.confidence < boundary_lock_confidence:
+        _append_island_expansion(
+            candidates,
+            source_indices=(left.source_index, *source_inner),
+            target_indices=(left.target_index, *target_inner),
+            base_score=base_score,
+            similarities=similarities,
+            source_embeddings=source_embeddings,
+            target_embeddings=target_embeddings,
+            max_source_span=max_composite_source,
+            max_target_span=max_composite_target,
+            min_score_gain=min_score_gain,
+        )
+    if not right.is_virtual and right.confidence < boundary_lock_confidence:
+        _append_island_expansion(
+            candidates,
+            source_indices=(*source_inner, right.source_index),
+            target_indices=(*target_inner, right.target_index),
+            base_score=base_score,
+            similarities=similarities,
+            source_embeddings=source_embeddings,
+            target_embeddings=target_embeddings,
+            max_source_span=max_composite_source,
+            max_target_span=max_composite_target,
+            min_score_gain=min_score_gain,
+        )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _append_island_expansion(
+    candidates: list[tuple[float, SpanIndices]],
+    *,
+    source_indices: tuple[int, ...],
+    target_indices: tuple[int, ...],
+    base_score: float,
+    similarities: ScoreMatrix,
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+) -> None:
+    if len(source_indices) > max_source_span or len(target_indices) > max_target_span:
+        return
+    score = _span_similarity(
+        source_indices,
+        target_indices,
+        similarities,
+        source_embeddings,
+        target_embeddings,
+    )
+    if _headroom_normalized_gain(score, base_score) >= min_score_gain:
+        candidates.append((score, (source_indices, target_indices)))
+
+
+def _headroom_normalized_gain(expanded_score: float, base_score: float) -> float:
+    if expanded_score <= base_score:
+        return 0.0
+    return (expanded_score - base_score) / max(1e-12, 1.0 - base_score)
 
 
 def _find_local_crossing_spans(
@@ -451,7 +922,7 @@ def _make_refined_span(
     source_indices: tuple[int, ...],
     target_indices: tuple[int, ...],
     *,
-    region: _ClauseRegion,
+    anchor_support: float,
     region_links: set[RawLink],
     similarities: ScoreMatrix,
     relative_similarities: ScoreMatrix,
@@ -478,7 +949,7 @@ def _make_refined_span(
         0.40 * relative_score
         + 0.25 * _mean_link_confidence(evidence_links, link_confidences)
         + 0.20 * similarity
-        + 0.15 * region.anchor_support
+        + 0.15 * anchor_support
     )
     return RefinedSpan(
         source_indices=source_indices,

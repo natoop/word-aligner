@@ -25,6 +25,7 @@ from app.schemas import (
     Token,
 )
 from app.span_refinement import RefinedSpan, refine_alignment_spans
+from app.temporal_rules import align_temporal_spans
 from app.tokenization import WordTokenizer
 
 RawLink = tuple[int, int]
@@ -294,11 +295,21 @@ class AlignmentService:
 
             links = set(method_links)
             links = _apply_protected_token_alignment(source_tokens, target_tokens, links)
+            temporal_alignment = align_temporal_spans(source_tokens, target_tokens)
+            if temporal_alignment.links:
+                links = {
+                    (source_index, target_index)
+                    for source_index, target_index in links
+                    if source_index not in temporal_alignment.source_indices
+                    and target_index not in temporal_alignment.target_indices
+                }
+                links.update(temporal_alignment.links)
             rule_links = {
                 (source_index, target_index)
                 for source_index, target_index in links
                 if source_tokens[source_index].is_protected or target_tokens[target_index].is_protected
             }
+            rule_links.update(temporal_alignment.links)
             link_scores = {
                 link: _score_model_link(embedding_result, link, normalized_alignments)
                 for link in links
@@ -346,6 +357,7 @@ class AlignmentService:
                     max_target_span=request.repair.max_target_span,
                     min_score_gain=request.repair.min_score_gain,
                     min_span_coverage=request.repair.min_span_coverage,
+                    min_anchor_confidence=request.repair.min_confidence,
                     source_embeddings=embedding_result.source_embeddings,
                     target_embeddings=embedding_result.target_embeddings,
                 )

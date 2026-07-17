@@ -125,7 +125,7 @@ Field constraints:
 - `repair.min_confidence`: minimum estimated confidence for a repaired link; defaults to `0.35`.
 - `repair.max_source_span`: maximum source-token count in a refined span; defaults to `3`.
 - `repair.max_target_span`: maximum target-token count in a refined span; defaults to `6`.
-- `repair.min_score_gain`: minimum pooled-embedding score improvement for a `span-aware` expansion; defaults to `0.05`.
+- `repair.min_score_gain`: minimum score improvement for `span-aware` expansion and normalized soft-island boundary expansion; defaults to `0.05`.
 - `repair.min_span_coverage`: coverage threshold used to detect asymmetric clauses and accept expansions; defaults to `0.75`.
 
 Conservative repair does not force every unaligned token onto a neighboring token. It first considers only content for which both sides remain unaligned, uses `mwmf` from the same embedding inference as a candidate, and filters by similarity, confidence, positional distance, and neighboring alignment anchors. Each repaired token can participate in only one new relationship.
@@ -135,6 +135,12 @@ It then checks clauses bounded by aligned punctuation or protected-token anchors
 When the full clause is larger than either limit, the limits apply to each local candidate span rather than disabling refinement. A bounded monotonic optimizer combines mean-pooled span similarity, neighborhood-relative evidence, and balanced token-position boundaries. It preserves self-contained model groups and rewrites only spans containing omissions, expansions, or cross-group links. Thus `This is a machine translation example. ↔ 这是一个机器翻译示例。` becomes `This is ↔ 这是`, `a ↔ 一个`, `machine translation ↔ 机器翻译`, and the unchanged model group `example ↔ 示例`. Local optimization is capped at 64 content tokens across both sides. Punctuation links remain atomic, and tokens covered by explicit phrase groups are not reported as unaligned.
 
 Full coverage does not automatically imply correct token roles. Within an anchored clause, a contiguous one-to-one chain that runs in exact reverse target order is collapsed into one local refined phrase group. This handles swaps such as `原子/链接 → links/atomic` as `原子链接 ↔ atomic links` while leaving the surrounding reordered but semantically valid links intact. Wider or non-contiguous reordering is not rewritten by this conservative crossing rule.
+
+Before missing-link repair and span refinement, deterministic temporal normalization handles non-monotonic year/month formats. English abbreviated or full month names are normalized to `month:1` through `month:12`; four-digit years and Chinese `number + 年` spans are normalized to `year:YYYY`; Chinese `number + 月` spans are normalized to the same month key. Matching spans replace conflicting model links with complete `origin: "rule"` relations. For example, `Feb 2025 ↔ 2025年2月` returns `Feb ↔ [2, 月]` and `2025 ↔ [2025, 年]`, both with `1.0` rule scores and no unaligned tokens.
+
+For an anchorless sentence with one-sided omissions, conservative repair builds soft anchors from monotonic one-to-one links whose confidence is at least `max(repair.min_confidence, 0.45)`. Intervals that are fully covered remain unchanged, even when an internal link is below the anchor threshold. A small one-sided gap is attached to the better neighboring anchor only when its pooled span score improves. The improvement is normalized by the remaining score headroom, `(expanded - base) / (1 - base)`, before comparison with `min_score_gain`.
+
+Larger intervals containing omissions and weak placeholder links become composite repair islands. One adjacent anchor may be absorbed when the same normalized gain test passes and the anchor confidence is below the boundary lock threshold. A composite island can combine up to two configured local spans, while the global 64-token safety bound still applies. For example, `Palm oil ↔ 棕榈油` becomes one refined group, and `and ingredients derived from palm oils ↔ 及其衍生成分` becomes a second refined group; the stable suffix `must / be / RSPO / certified` keeps its model links.
 
 `span-aware` includes the same conservative behavior and can additionally expand only one side of an existing group to contiguous, currently unaligned tokens when mean-pooled span embeddings improve by at least `min_score_gain`. Expansions cannot overlap, cross punctuation or protected-token anchors, or exceed the configured span limits.
 
@@ -191,7 +197,7 @@ Response structure example (alignment content is illustrative; actual results de
 Link `origin` identifies how each atomic relation was created:
 
 - `model`: returned by the selected SimAlign method.
-- `rule`: created by exact placeholder or markup matching.
+- `rule`: created by exact protected-token matching or normalized temporal matching.
 - `repaired`: added by conservative repair.
 
 Groups also expose `origin`, `similarity`, and `confidence`. A group with one link origin inherits that origin, a component containing multiple origins is `mixed`, and an explicit phrase span is `refined`. A conservative collapsed group has an empty `links` array because the service is intentionally withholding ambiguous token-level claims; a `span-aware` expansion retains its underlying evidence links.
