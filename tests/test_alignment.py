@@ -16,7 +16,8 @@ from app.alignment import (
     _ensure_device_available,
 )
 from app.config import Settings
-from app.schemas import AlignmentRequest
+from app.schemas import AlignmentRequest, Token
+from app.span_refinement import _drop_weak_links_crossing_hard_anchors
 from app.tokenization import WordTokenizer
 
 
@@ -47,6 +48,16 @@ def _date_tokenize(value: str):
 
 def _palm_ingredients_tokenize(value: str):
     for match in re.finditer(r"棕榈油|及其|衍生|成分|必须|获得|RSPO|认证", value):
+        yield match.group(), match.start(), match.end()
+
+
+def _certification_programme_tokenize(value: str):
+    for match in re.finditer(r"森林|认证|认可|计划|（|PEFC|）|。", value):
+        yield match.group(), match.start(), match.end()
+
+
+def _availability_clause_tokenize(value: str):
+    for match in re.finditer(r"如果|材料|不可|用|，|则|纸基|包装|。", value):
         yield match.group(), match.start(), match.end()
 
 
@@ -592,6 +603,158 @@ def test_temporal_rules_are_symmetric_for_chinese_to_english_dates() -> None:
         (2, 0, "rule"),
         (3, 0, "rule"),
     ]
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_quantity_rules_align_percentages_with_different_token_boundaries() -> None:
+    backend = StubBackend({(0, 0), (2, 1)}, {"mwmf": {(0, 0), (2, 1)}})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_whitespace_tokenize),
+        backend_factory=lambda: backend,
+    )
+
+    result = service.align(_request("70% recycled", "70% 回收")).sentence_alignments[0]
+
+    assert [(link.source_index, link.target_index, link.origin) for link in result.links] == [
+        (0, 0, "rule"),
+        (1, 0, "rule"),
+        (2, 1, "model"),
+    ]
+    assert result.alignment_groups[0].type == "many-to-one"
+    assert result.alignment_groups[0].source_tokens == ["70", "%"]
+    assert result.alignment_groups[0].target_tokens == ["70%"]
+    assert result.alignment_groups[0].similarity == 1.0
+    assert result.alignment_groups[0].confidence == 1.0
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_conservative_repair_collapses_a_gapped_reverse_term_run_into_one_phrase() -> None:
+    links = {
+        (0, 3),
+        (3, 2),
+        (5, 0),
+        (6, 4),
+        (7, 5),
+        (8, 6),
+        (9, 7),
+    }
+    backend = StubBackend(links, {"mwmf": links})
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_certification_programme_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "repair": {
+                "strategy": "conservative",
+                "max_source_span": 3,
+                "max_target_span": 6,
+            },
+            "sentence_pairs": [
+                {
+                    "source": "Programme for the Endorsement of Forest (PEFC).",
+                    "target": "森林认证认可计划（PEFC）。",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    refined_group = next(group for group in result.alignment_groups if group.origin == "refined")
+    assert refined_group.source_tokens == ["Programme", "for", "the", "Endorsement", "of", "Forest"]
+    assert refined_group.target_tokens == ["森林", "认证", "认可", "计划"]
+    assert refined_group.links == []
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_span_refinement_drops_a_weak_link_that_crosses_an_aligned_punctuation_anchor() -> None:
+    source_tokens = [
+        Token(index=0, text="before", start=0, end=6),
+        Token(index=1, text=",", start=6, end=7),
+        Token(index=2, text="after", start=8, end=13),
+    ]
+    target_tokens = [
+        Token(index=0, text="之前", start=0, end=2),
+        Token(index=1, text="，", start=2, end=3),
+        Token(index=2, text="之后", start=3, end=5),
+    ]
+    links = {(0, 0), (1, 1), (2, 0)}
+
+    filtered = _drop_weak_links_crossing_hard_anchors(
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+        links=links,
+        link_confidences={(0, 0): 0.8, (1, 1): 0.8, (2, 0): 0.3},
+        locked_links=set(),
+        min_anchor_confidence=0.35,
+    )
+
+    assert filtered == {(0, 0), (1, 1)}
+
+
+def test_conservative_repair_fills_bounded_gaps_without_rewriting_stable_suffix_links() -> None:
+    links = {(0, 0), (3, 2), (5, 4), (6, 5), (7, 1), (8, 7), (9, 8)}
+    similarities = np.full((10, 9), 0.1, dtype=float)
+    for source_index, target_index in links:
+        similarities[source_index, target_index] = 0.9
+    for source_index, target_index in {(0, 0), (1, 1), (3, 2), (4, 3), (6, 5), (7, 6), (8, 7)}:
+        similarities[source_index, target_index] = 0.95
+    similarities[3, 2] = 0.60
+    similarities[3, 3] = 0.59
+    similarities[4, 2] = 0.59
+
+    source_embeddings = [[1.0, 0.0]] * 10
+    target_embeddings = [[1.0, 0.0]] * 9
+    for source_index in (2, 3, 4):
+        source_embeddings[source_index] = [0.0, 1.0]
+    for target_index in (2, 3):
+        target_embeddings[target_index] = [0.0, 1.0]
+
+    backend = StubBackend(
+        links,
+        {"mwmf": links},
+        similarities=similarities.tolist(),
+        source_embeddings=source_embeddings,
+        target_embeddings=target_embeddings,
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_availability_clause_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "repair": {"strategy": "conservative"},
+            "sentence_pairs": [
+                {
+                    "source": "If content is not available, then paper-based packaging.",
+                    "target": "如果材料不可用，则纸基包装。",
+                }
+            ],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert [group.source_tokens for group in refined_groups] == [
+        ["content", "is", "not", "available"],
+        ["paper-based"],
+    ]
+    assert [group.target_tokens for group in refined_groups] == [["材料", "不可", "用"], ["纸基"]]
+    assert any(group.source_tokens == ["then"] and group.origin == "model" for group in result.alignment_groups)
+    assert any(group.source_tokens == ["packaging"] and group.origin == "model" for group in result.alignment_groups)
+    assert all(not (link.source_index == 7 and link.target_index == 1) for link in result.links)
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
 

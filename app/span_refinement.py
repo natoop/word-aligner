@@ -14,6 +14,7 @@ RawLink = tuple[int, int]
 ScoreMatrix = Sequence[Sequence[float]]
 SpanIndices = tuple[tuple[int, ...], tuple[int, ...]]
 MAX_LOCAL_SEGMENTATION_TOKENS = 64
+PARTITION_SEGMENT_PENALTY = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,14 +92,29 @@ def refine_alignment_spans(
     max_target_span: int,
     min_score_gain: float,
     min_span_coverage: float,
+    min_similarity: float,
     min_anchor_confidence: float,
+    locked_links: set[RawLink] | frozenset[RawLink] = frozenset(),
     source_embeddings: np.ndarray | None = None,
     target_embeddings: np.ndarray | None = None,
 ) -> SpanRefinement:
     """Refine low-coverage clauses without inventing token-level correspondences."""
 
-    current_links = set(links)
-    regions = _extract_clause_regions(source_tokens, target_tokens, current_links)
+    locked_link_set = set(locked_links).intersection(links)
+    current_links = _drop_weak_links_crossing_hard_anchors(
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+        links=links,
+        link_confidences=link_confidences,
+        locked_links=locked_link_set,
+        min_anchor_confidence=min_anchor_confidence,
+    )
+    regions = _extract_clause_regions(
+        source_tokens,
+        target_tokens,
+        current_links,
+        locked_links=locked_link_set,
+    )
     soft_refinement = _SoftRefinement(
         links=frozenset(current_links),
         groups=(),
@@ -121,7 +137,12 @@ def refine_alignment_spans(
             min_anchor_confidence=min_anchor_confidence,
         )
         current_links = set(soft_refinement.links)
-        regions = _extract_clause_regions(source_tokens, target_tokens, current_links)
+        regions = _extract_clause_regions(
+            source_tokens,
+            target_tokens,
+            current_links,
+            locked_links=locked_link_set,
+        )
 
     groups: list[RefinedSpan] = list(soft_refinement.groups)
     refined_regions: set[SpanIndices] = set()
@@ -143,19 +164,50 @@ def refine_alignment_spans(
             region_links,
             max_source_span=max_source_span,
             max_target_span=max_target_span,
+            locked_links=locked_link_set,
+        )
+        bounded_gap_spans = (
+            _find_bounded_dual_gap_spans(
+                region,
+                region_links,
+                similarities,
+                source_embeddings,
+                target_embeddings,
+                link_confidences=link_confidences,
+                locked_links=locked_link_set,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+                min_score_gain=min_score_gain,
+                min_similarity=min_similarity,
+                min_anchor_confidence=min_anchor_confidence,
+            )
+            if has_low_coverage and not crossing_spans
+            else ()
+        )
+        bounded_gaps_restore_coverage = bool(bounded_gap_spans) and _spans_restore_region_coverage(
+            region,
+            region_links,
+            bounded_gap_spans,
+            min_span_coverage=min_span_coverage,
         )
         if not has_low_coverage and not crossing_spans:
             continue
 
-        if has_low_coverage:
+        if crossing_spans:
+            spans_to_refine = list(crossing_spans)
+        elif bounded_gaps_restore_coverage:
+            spans_to_refine = list(bounded_gap_spans)
+        elif has_low_coverage:
             partition = _partition_region(
                 region,
+                region_links,
                 similarities,
                 relative_similarities,
                 source_embeddings,
                 target_embeddings,
                 max_source_span=max_source_span,
                 max_target_span=max_target_span,
+                locked_links=locked_link_set,
             )
             if partition is None:
                 continue
@@ -163,7 +215,7 @@ def refine_alignment_spans(
                 span for span in partition if not _is_stable_partition_span(span[0], span[1], region_links)
             ]
         else:
-            spans_to_refine = list(crossing_spans)
+            spans_to_refine = []
         if not spans_to_refine:
             continue
 
@@ -220,21 +272,16 @@ def _extract_clause_regions(
     source_tokens: Sequence[Token],
     target_tokens: Sequence[Token],
     links: set[RawLink],
+    *,
+    locked_links: set[RawLink],
 ) -> list[_ClauseRegion]:
-    anchor_candidates = sorted(
-        (
-            _Anchor(source_index, target_index, True)
-            for source_index, target_index in links
-            if _is_anchor_pair(source_tokens[source_index], target_tokens[target_index])
-        ),
-        key=lambda anchor: (anchor.source_index, anchor.target_index),
-    )
-    anchors = [_Anchor(-1, -1, False)]
-    for candidate in anchor_candidates:
-        previous = anchors[-1]
-        if candidate.source_index > previous.source_index and candidate.target_index > previous.target_index:
-            anchors.append(candidate)
-    anchors.append(_Anchor(len(source_tokens), len(target_tokens), False))
+    anchors = [
+        _Anchor(-1, -1, False),
+        *_select_hard_anchors(source_tokens, target_tokens, links),
+        _Anchor(len(source_tokens), len(target_tokens), False),
+    ]
+    locked_source = {source_index for source_index, _ in locked_links}
+    locked_target = {target_index for _, target_index in locked_links}
 
     regions: list[_ClauseRegion] = []
     for previous, following in zip(anchors, anchors[1:], strict=False):
@@ -242,9 +289,9 @@ def _extract_clause_regions(
         target_indices = tuple(range(previous.target_index + 1, following.target_index))
         if not source_indices or not target_indices:
             continue
-        if not all(_is_content_token(source_tokens[index]) for index in source_indices):
+        if not all(_is_content_token(source_tokens[index]) or index in locked_source for index in source_indices):
             continue
-        if not all(_is_content_token(target_tokens[index]) for index in target_indices):
+        if not all(_is_content_token(target_tokens[index]) or index in locked_target for index in target_indices):
             continue
         if not previous.is_actual and not following.is_actual:
             continue
@@ -256,6 +303,56 @@ def _extract_clause_regions(
             )
         )
     return regions
+
+
+def _select_hard_anchors(
+    source_tokens: Sequence[Token],
+    target_tokens: Sequence[Token],
+    links: set[RawLink],
+) -> tuple[_Anchor, ...]:
+    candidates = sorted(
+        (
+            _Anchor(source_index, target_index, True)
+            for source_index, target_index in links
+            if _is_anchor_pair(source_tokens[source_index], target_tokens[target_index])
+        ),
+        key=lambda anchor: (anchor.source_index, anchor.target_index),
+    )
+    anchors: list[_Anchor] = []
+    for candidate in candidates:
+        if not anchors or (
+            candidate.source_index > anchors[-1].source_index and candidate.target_index > anchors[-1].target_index
+        ):
+            anchors.append(candidate)
+    return tuple(anchors)
+
+
+def _drop_weak_links_crossing_hard_anchors(
+    *,
+    source_tokens: Sequence[Token],
+    target_tokens: Sequence[Token],
+    links: set[RawLink],
+    link_confidences: Mapping[RawLink, float],
+    locked_links: set[RawLink],
+    min_anchor_confidence: float,
+) -> set[RawLink]:
+    anchors = _select_hard_anchors(source_tokens, target_tokens, links)
+    if not anchors:
+        return set(links)
+
+    boundary_lock_confidence = max(0.55, min_anchor_confidence + 0.10)
+    return {
+        link
+        for link in links
+        if link in locked_links
+        or link_confidences.get(link, 0.0) >= boundary_lock_confidence
+        or not any(_link_crosses_anchor(link, anchor) for anchor in anchors)
+    }
+
+
+def _link_crosses_anchor(link: RawLink, anchor: _Anchor) -> bool:
+    source_index, target_index = link
+    return (source_index - anchor.source_index) * (target_index - anchor.target_index) < 0
 
 
 def _is_anchor_pair(source_token: Token, target_token: Token) -> bool:
@@ -317,6 +414,180 @@ def _region_coverage(
         len(aligned_source) / len(region.source_indices),
         len(aligned_target) / len(region.target_indices),
     )
+
+
+def _spans_restore_region_coverage(
+    region: _ClauseRegion,
+    region_links: set[RawLink],
+    spans: tuple[SpanIndices, ...],
+    *,
+    min_span_coverage: float,
+) -> bool:
+    aligned_source = {source_index for source_index, _ in region_links}
+    aligned_target = {target_index for _, target_index in region_links}
+    for source_indices, target_indices in spans:
+        aligned_source.update(source_indices)
+        aligned_target.update(target_indices)
+    return (
+        len(aligned_source) / len(region.source_indices) >= min_span_coverage
+        and len(aligned_target) / len(region.target_indices) >= min_span_coverage
+    )
+
+
+def _find_bounded_dual_gap_spans(
+    region: _ClauseRegion,
+    region_links: set[RawLink],
+    similarities: ScoreMatrix,
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    *,
+    link_confidences: Mapping[RawLink, float],
+    locked_links: set[RawLink],
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+    min_similarity: float,
+    min_anchor_confidence: float,
+) -> tuple[SpanIndices, ...]:
+    source_targets: dict[int, set[int]] = defaultdict(set)
+    target_sources: dict[int, set[int]] = defaultdict(set)
+    for source_index, target_index in region_links:
+        source_targets[source_index].add(target_index)
+        target_sources[target_index].add(source_index)
+
+    candidates = sorted(
+        (source_index, next(iter(targets)))
+        for source_index, targets in source_targets.items()
+        if len(targets) == 1 and len(target_sources[next(iter(targets))]) == 1
+    )
+    anchors = [_Anchor(region.source_indices[0] - 1, region.target_indices[0] - 1, False)]
+    for source_index, target_index in candidates:
+        previous = anchors[-1]
+        if source_index > previous.source_index and target_index > previous.target_index:
+            anchors.append(_Anchor(source_index, target_index, True))
+    anchors.append(_Anchor(region.source_indices[-1] + 1, region.target_indices[-1] + 1, False))
+
+    aligned_source = set(source_targets)
+    aligned_target = set(target_sources)
+    spans: list[SpanIndices] = []
+    for left, right in zip(anchors, anchors[1:], strict=False):
+        source_inner = tuple(range(left.source_index + 1, right.source_index))
+        target_inner = tuple(range(left.target_index + 1, right.target_index))
+        if not source_inner or not target_inner:
+            continue
+        if aligned_source.intersection(source_inner) or aligned_target.intersection(target_inner):
+            continue
+        if len(source_inner) > max_source_span or len(target_inner) > max_target_span:
+            continue
+        similarity = _span_similarity(
+            source_inner,
+            target_inner,
+            similarities,
+            source_embeddings,
+            target_embeddings,
+        )
+        if similarity >= min_similarity:
+            spans.append((source_inner, target_inner))
+    return _merge_adjacent_bounded_gaps(
+        spans,
+        region_links=region_links,
+        similarities=similarities,
+        link_confidences=link_confidences,
+        locked_links=locked_links,
+        source_embeddings=source_embeddings,
+        target_embeddings=target_embeddings,
+        max_source_span=max_source_span,
+        max_target_span=max_target_span,
+        min_score_gain=min_score_gain,
+        min_anchor_confidence=min_anchor_confidence,
+    )
+
+
+def _merge_adjacent_bounded_gaps(
+    spans: list[SpanIndices],
+    *,
+    region_links: set[RawLink],
+    similarities: ScoreMatrix,
+    link_confidences: Mapping[RawLink, float],
+    locked_links: set[RawLink],
+    source_embeddings: np.ndarray | None,
+    target_embeddings: np.ndarray | None,
+    max_source_span: int,
+    max_target_span: int,
+    min_score_gain: float,
+    min_anchor_confidence: float,
+) -> tuple[SpanIndices, ...]:
+    if len(spans) < 2:
+        return tuple(spans)
+
+    max_composite_source = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_source_span * 2)
+    max_composite_target = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_target_span * 2)
+    boundary_lock_confidence = max(0.55, min_anchor_confidence + 0.10)
+    merged: list[SpanIndices] = []
+    index = 0
+    while index < len(spans):
+        if index + 1 >= len(spans):
+            merged.append(spans[index])
+            break
+
+        first = spans[index]
+        second = spans[index + 1]
+        combined_source = tuple(range(first[0][0], second[0][-1] + 1))
+        combined_target = tuple(range(first[1][0], second[1][-1] + 1))
+        combined_source_set = set(combined_source)
+        combined_target_set = set(combined_target)
+        incident_links = {
+            link for link in region_links if link[0] in combined_source_set or link[1] in combined_target_set
+        }
+        internal_links = {
+            link for link in incident_links if link[0] in combined_source_set and link[1] in combined_target_set
+        }
+        can_merge = (
+            len(combined_source) <= max_composite_source
+            and len(combined_target) <= max_composite_target
+            and bool(internal_links)
+            and incident_links == internal_links
+            and not internal_links.intersection(locked_links)
+            and all(link_confidences.get(link, 0.0) < boundary_lock_confidence for link in internal_links)
+        )
+        if can_merge:
+            parts = [first]
+            parts.extend(
+                (
+                    tuple(sorted({source_index for source_index, _ in component})),
+                    tuple(sorted({target_index for _, target_index in component})),
+                )
+                for component in _link_components(internal_links)
+            )
+            parts.append(second)
+            weighted_score = 0.0
+            total_weight = 0
+            for source_indices, target_indices in parts:
+                weight = len(source_indices) + len(target_indices)
+                weighted_score += weight * _span_similarity(
+                    source_indices,
+                    target_indices,
+                    similarities,
+                    source_embeddings,
+                    target_embeddings,
+                )
+                total_weight += weight
+            base_score = weighted_score / total_weight
+            expanded_score = _span_similarity(
+                combined_source,
+                combined_target,
+                similarities,
+                source_embeddings,
+                target_embeddings,
+            )
+            if _headroom_normalized_gain(expanded_score, base_score) >= min_score_gain:
+                merged.append((combined_source, combined_target))
+                index += 2
+                continue
+
+        merged.append(first)
+        index += 1
+    return tuple(merged)
 
 
 def _refine_soft_anchor_islands(
@@ -751,48 +1022,59 @@ def _find_local_crossing_spans(
     *,
     max_source_span: int,
     max_target_span: int,
+    locked_links: set[RawLink],
 ) -> tuple[SpanIndices, ...]:
-    if max_source_span < 2 or max_target_span < 2:
-        return ()
-
     source_targets: dict[int, set[int]] = defaultdict(set)
     target_sources: dict[int, set[int]] = defaultdict(set)
     for source_index, target_index in region_links:
         source_targets[source_index].add(target_index)
         target_sources[target_index].add(source_index)
 
-    unique_links = {
-        source_index: next(iter(targets))
+    unique_links = sorted(
+        (source_index, next(iter(targets)))
         for source_index, targets in source_targets.items()
-        if len(targets) == 1 and len(target_sources[next(iter(targets))]) == 1
-    }
-    source_indices = sorted(unique_links)
+        if len(targets) == 1
+        and len(target_sources[next(iter(targets))]) == 1
+        and (source_index, next(iter(targets))) not in locked_links
+    )
+    max_composite_source = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_source_span * 2)
+    max_composite_target = min(MAX_LOCAL_SEGMENTATION_TOKENS, max_target_span * 2)
+    locked_source = {source_index for source_index, _ in locked_links}
+    locked_target = {target_index for _, target_index in locked_links}
     spans: list[SpanIndices] = []
     cursor = 0
-    while cursor < len(source_indices):
-        run_sources = [source_indices[cursor]]
-        run_targets = [unique_links[source_indices[cursor]]]
+    while cursor < len(unique_links):
+        run_sources = [unique_links[cursor][0]]
+        run_targets = [unique_links[cursor][1]]
         next_cursor = cursor + 1
-        while next_cursor < len(source_indices):
-            next_source = source_indices[next_cursor]
-            next_target = unique_links[next_source]
-            if next_source != run_sources[-1] + 1 or next_target != run_targets[-1] - 1:
+        while next_cursor < len(unique_links):
+            next_source, next_target = unique_links[next_cursor]
+            source_gap = next_source - run_sources[-1]
+            target_drop = run_targets[-1] - next_target
+            if source_gap <= 0 or target_drop <= 0:
                 break
-            if len(run_sources) >= min(max_source_span, max_target_span):
+            if source_gap == 1 and target_drop > 1:
+                break
+            source_range = range(run_sources[0], next_source + 1)
+            target_range = range(next_target, run_targets[0] + 1)
+            if len(source_range) > max_composite_source or len(target_range) > max_composite_target:
+                break
+            if locked_source.intersection(source_range) or locked_target.intersection(target_range):
                 break
             run_sources.append(next_source)
             run_targets.append(next_target)
             next_cursor += 1
 
-        if len(run_sources) >= 2:
-            target_indices = tuple(sorted(run_targets))
-            if (
-                tuple(run_sources) == tuple(range(run_sources[0], run_sources[-1] + 1))
-                and target_indices == tuple(range(target_indices[0], target_indices[-1] + 1))
-                and set(run_sources).issubset(region.source_indices)
-                and set(target_indices).issubset(region.target_indices)
+        is_adjacent_pair = (
+            len(run_sources) == 2 and run_sources[1] == run_sources[0] + 1 and run_targets[1] == run_targets[0] - 1
+        )
+        if len(run_sources) >= 3 or is_adjacent_pair:
+            source_indices = tuple(range(run_sources[0], run_sources[-1] + 1))
+            target_indices = tuple(range(min(run_targets), max(run_targets) + 1))
+            if set(source_indices).issubset(region.source_indices) and set(target_indices).issubset(
+                region.target_indices
             ):
-                spans.append((tuple(run_sources), target_indices))
+                spans.append((source_indices, target_indices))
                 cursor = next_cursor
                 continue
         cursor += 1
@@ -801,6 +1083,7 @@ def _find_local_crossing_spans(
 
 def _partition_region(
     region: _ClauseRegion,
+    region_links: set[RawLink],
     similarities: ScoreMatrix,
     relative_similarities: ScoreMatrix,
     source_embeddings: np.ndarray | None,
@@ -808,14 +1091,29 @@ def _partition_region(
     *,
     max_source_span: int,
     max_target_span: int,
+    locked_links: set[RawLink],
 ) -> tuple[SpanIndices, ...] | None:
-    if len(region.source_indices) <= max_source_span and len(region.target_indices) <= max_target_span:
-        return ((region.source_indices, region.target_indices),)
     if len(region.source_indices) + len(region.target_indices) > MAX_LOCAL_SEGMENTATION_TOKENS:
         return None
 
     source_count = len(region.source_indices)
     target_count = len(region.target_indices)
+    region_locked_links = {
+        link for link in locked_links if link[0] in region.source_indices and link[1] in region.target_indices
+    }
+    locked_components = tuple(
+        (
+            tuple(sorted({source_index for source_index, _ in component})),
+            tuple(sorted({target_index for _, target_index in component})),
+        )
+        for component in _link_components(region_locked_links)
+    )
+    if (
+        len(region.source_indices) <= max_source_span
+        and len(region.target_indices) <= max_target_span
+        and (not locked_components or (region.source_indices, region.target_indices) in locked_components)
+    ):
+        return ((region.source_indices, region.target_indices),)
     states: dict[tuple[int, int], _PartitionState] = {(0, 0): _PartitionState(score=0.0, spans=())}
     for source_offset in range(source_count + 1):
         for target_offset in range(target_count + 1):
@@ -830,11 +1128,26 @@ def _partition_region(
                     target_end = target_offset + target_length
                     if target_end > target_count:
                         break
-                    if source_length > 1 and target_length > 1:
-                        continue
-
                     source_indices = region.source_indices[source_offset:source_end]
                     target_indices = region.target_indices[target_offset:target_end]
+                    if not _candidate_respects_locked_components(
+                        source_indices,
+                        target_indices,
+                        locked_components,
+                    ):
+                        continue
+                    is_locked_component = (source_indices, target_indices) in locked_components
+                    if (
+                        source_length > 1
+                        and target_length > 1
+                        and not is_locked_component
+                        and not _has_internal_crossing_evidence(
+                            source_indices,
+                            target_indices,
+                            region_links,
+                        )
+                    ):
+                        continue
                     semantic_score = _span_similarity(
                         source_indices,
                         target_indices,
@@ -854,8 +1167,9 @@ def _partition_region(
                         target_count,
                     )
                     candidate_score = 0.45 * semantic_score + 0.10 * relative_score + 0.45 * boundary_score
+                    span_weight = source_length + target_length
                     candidate_state = _PartitionState(
-                        score=state.score + candidate_score,
+                        score=state.score + candidate_score * span_weight - PARTITION_SEGMENT_PENALTY,
                         spans=state.spans + ((source_indices, target_indices),),
                     )
                     key = (source_end, target_end)
@@ -865,6 +1179,35 @@ def _partition_region(
 
     result = states.get((source_count, target_count))
     return result.spans if result is not None else None
+
+
+def _candidate_respects_locked_components(
+    source_indices: tuple[int, ...],
+    target_indices: tuple[int, ...],
+    locked_components: tuple[SpanIndices, ...],
+) -> bool:
+    source_set = set(source_indices)
+    target_set = set(target_indices)
+    for locked_source, locked_target in locked_components:
+        overlaps = bool(source_set.intersection(locked_source) or target_set.intersection(locked_target))
+        if overlaps and (source_indices, target_indices) != (locked_source, locked_target):
+            return False
+    return True
+
+
+def _has_internal_crossing_evidence(
+    source_indices: tuple[int, ...],
+    target_indices: tuple[int, ...],
+    region_links: set[RawLink],
+) -> bool:
+    source_set = set(source_indices)
+    target_set = set(target_indices)
+    internal_links = sorted(link for link in region_links if link[0] in source_set and link[1] in target_set)
+    return any(
+        first_source < second_source and first_target > second_target
+        for index, (first_source, first_target) in enumerate(internal_links)
+        for second_source, second_target in internal_links[index + 1 :]
+    )
 
 
 def _balanced_boundary_score(
@@ -891,7 +1234,7 @@ def _is_better_partition(
     if not math.isclose(candidate.score, existing.score, abs_tol=1e-12):
         return candidate.score > existing.score
     if len(candidate.spans) != len(existing.spans):
-        return len(candidate.spans) > len(existing.spans)
+        return len(candidate.spans) < len(existing.spans)
     candidate_lengths = tuple(
         (len(source_indices), len(target_indices)) for source_indices, target_indices in candidate.spans
     )

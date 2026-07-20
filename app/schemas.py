@@ -64,7 +64,7 @@ class RepairOptions(BaseModel):
         default=0.05,
         ge=0.0,
         le=1.0,
-        description="Minimum score gain for span-aware and soft-island expansion",
+        description="Minimum score gain for span-aware and composite repair-island expansion",
     )
     min_span_coverage: float = Field(
         default=0.75,

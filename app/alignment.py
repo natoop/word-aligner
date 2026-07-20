@@ -14,6 +14,7 @@ import numpy as np
 
 from app.config import Settings
 from app.model_cache import configure_huggingface_access
+from app.quantity_rules import align_quantity_spans
 from app.schemas import (
     AlignmentGroup,
     AlignmentGroupOrigin,
@@ -304,12 +305,23 @@ class AlignmentService:
                     and target_index not in temporal_alignment.target_indices
                 }
                 links.update(temporal_alignment.links)
+            quantity_alignment = align_quantity_spans(source_tokens, target_tokens)
+            if quantity_alignment.links:
+                links = {
+                    (source_index, target_index)
+                    for source_index, target_index in links
+                    if source_index not in quantity_alignment.source_indices
+                    and target_index not in quantity_alignment.target_indices
+                }
+                links.update(quantity_alignment.links)
+            normalized_rule_links = set(temporal_alignment.links) | set(quantity_alignment.links)
             rule_links = {
                 (source_index, target_index)
                 for source_index, target_index in links
-                if source_tokens[source_index].is_protected or target_tokens[target_index].is_protected
+                if source_tokens[source_index].is_protected
+                or target_tokens[target_index].is_protected
+                or (source_index, target_index) in normalized_rule_links
             }
-            rule_links.update(temporal_alignment.links)
             link_scores = {
                 link: _score_model_link(embedding_result, link, normalized_alignments)
                 for link in links
@@ -357,7 +369,9 @@ class AlignmentService:
                     max_target_span=request.repair.max_target_span,
                     min_score_gain=request.repair.min_score_gain,
                     min_span_coverage=request.repair.min_span_coverage,
+                    min_similarity=request.repair.min_similarity,
                     min_anchor_confidence=request.repair.min_confidence,
+                    locked_links=rule_links,
                     source_embeddings=embedding_result.source_embeddings,
                     target_embeddings=embedding_result.target_embeddings,
                 )
