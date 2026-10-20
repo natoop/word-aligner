@@ -25,7 +25,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000/docs` for Swagger UI. You can also run the service with Docker Compose:
+Open `http://localhost:8000/demo` for the interactive demo, or `http://localhost:8000/docs` for Swagger UI. The demo sends requests to the same-origin `/api/v1/align` endpoint by default, loads language choices from `GET /api/v1/languages`, supports multiple sentence pairs, highlights grouped alignments, and shows the original JSON response. No supported-language list needs to be entered by hand. The current local test address is `http://localhost:8000`. Serve the page through `/demo` instead of opening the HTML file directly, since browsers may block `file://` requests to the API. You can also run the service with Docker Compose:
 
 ```powershell
 docker volume create word-aligner-models

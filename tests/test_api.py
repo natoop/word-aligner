@@ -92,6 +92,35 @@ def test_align_endpoint_returns_languages_and_grouped_links() -> None:
     assert all(0.0 <= link["confidence"] <= 1.0 for link in links)
 
 
+def test_demo_endpoint_serves_the_html_page_without_loading_model() -> None:
+    async def get_demo() -> tuple[httpx.Response, AlignmentService]:
+        app = _app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get("/demo")
+        return response, app.state.alignment_service
+
+    response, service = asyncio.run(get_demo())
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "<!doctype html>" in response.text.lower()
+    assert "/api/v1/align" in response.text
+    assert "json" in response.text.lower()
+    assert service.model_loaded is False
+
+
+def test_root_endpoint_keeps_returning_service_metadata() -> None:
+    response = asyncio.run(_request("GET", "/"))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "name": "Multilingual Word Alignment API",
+        "version": "0.3.0",
+        "docs": "/docs",
+    }
+
+
 def test_align_endpoint_rejects_an_invalid_language_code() -> None:
     response = asyncio.run(
         _request(

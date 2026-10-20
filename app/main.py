@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.alignment import AlignmentModelError, AlignmentProcessingError, AlignmentService
@@ -69,6 +70,11 @@ def create_app(
             "version": resolved_settings.app_version,
             "docs": "/docs",
         }
+
+    @application.get("/demo", include_in_schema=False)
+    async def demo() -> FileResponse:
+        demo_path = Path(__file__).resolve().parent / "static" / "align.html"
+        return FileResponse(demo_path, media_type="text/html")
 
     @application.get(
         "/health/live",

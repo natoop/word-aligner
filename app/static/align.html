@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Word Aligner · 双语对齐工作台</title>
+  <style>
+    :root { color-scheme: light; --ink: #172e35; --muted: #60747a; --line: #dce6e7; --accent: #087f78; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3f7f7; color: var(--ink); font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button, input, select, textarea, summary { outline-offset: 4px; }
+    :focus-visible { outline: 2px solid var(--accent); }
+    button:disabled { opacity: .5; cursor: wait; }
+    [hidden] { display: none !important; }
+    header { background: #16373d; color: white; padding: 34px max(24px, calc((100vw - 1160px) / 2)); }
+    .eyebrow { color: #9cd6d0; font-size: 11px; letter-spacing: .18em; font-weight: 700; }
+    h1 { font-size: clamp(24px, 4vw, 34px); letter-spacing: -.035em; margin: 8px 0; font-weight: 650; }
+    header p { margin: 0; color: #bad0d4; }
+    main { max-width: 1208px; margin: 28px auto 60px; padding: 0 24px; }
+    .panel, .result-card { background: white; border: 1px solid var(--line); border-radius: 14px; padding: 24px; margin-bottom: 20px; }
+    .heading, .actions, .pair-heading, .result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    h2 { font-size: 18px; margin: 0; } h3 { font-size: 15px; margin: 0; }
+    .muted, .hint { color: var(--muted); } .hint { font-size: 12px; margin: 7px 0 0; }
+    label { display: block; font-weight: 600; font-size: 13px; }
+    input, select, textarea { width: 100%; margin-top: 7px; padding: 10px 12px; border: 1px solid #cbdadc; border-radius: 8px; background: white; color: var(--ink); }
+    textarea { min-height: 122px; resize: vertical; line-height: 1.8; font-weight: 400; }
+    input:hover, select:hover, textarea:hover { border-color: #8aaeb0; }
+    fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+    .settings { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin: 24px 0 4px; }
+    .pair-inputs, .text-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+    .pair-editor { padding: 20px 0; border-bottom: 1px solid var(--line); }
+    .pair-heading { margin-bottom: 12px; } .pair-title { font-size: 13px; color: var(--muted); }
+    .button { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 8px 15px; border: 1px solid #cbdadc; border-radius: 8px; background: white; color: var(--ink); font-weight: 600; text-decoration: none; }
+    .button:hover { background: #eff6f5; border-color: #a5c9c5; }
+    .primary { background: var(--accent); border-color: var(--accent); color: white; padding-inline: 24px; }
+    .primary:hover { background: #066c67; color: white; }
+    .quiet { color: var(--muted); background: transparent; border: 0; padding: 4px 8px; }
+    .actions { margin-top: 20px; } .actions > div { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    details { margin-top: 16px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+    .endpoint { margin-top: 14px; }
+    .status { margin: 16px 0 0; padding: 11px 14px; border-radius: 8px; background: #eef5f5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .status[data-state="error"] { color: #a32c37; background: #fff0f0; }
+    .status[data-state="success"] { color: #086b58; background: #eaf6f1; }
+    .status[data-state="loading"]::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 10px; border: 2px solid #b7d7d5; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .empty { padding: 48px 24px; text-align: center; border: 1px dashed #cbdadc; border-radius: 14px; color: var(--muted); }
+    .empty strong { display: block; color: var(--ink); font-size: 16px; margin-bottom: 6px; }
+    .results-header { margin: 28px 0 16px; }
+    .result-heading { margin-bottom: 20px; }
+    .badge { background: #eff5f5; border-radius: 5px; padding: 3px 8px; font-size: 12px; color: var(--muted); }
+    .text-block { min-width: 0; }
+    .text-label { color: var(--muted); font-size: 11px; letter-spacing: .08em; margin-bottom: 8px; font-weight: 700; }
+    .aligned-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 2.25; font-size: 18px; padding: 14px; background: #f8fafa; border: 1px solid #e8eeee; border-radius: 9px; min-height: 100px; }
+    .token { display: inline; color: inherit; font: inherit; line-height: inherit; white-space: pre-wrap; border: 0; border-bottom: 2px solid var(--group-color, #a3afb0); border-radius: 3px; padding: 1px 0; background: var(--group-bg, transparent); transition: opacity .12s; }
+    .token.unaligned { border-bottom: 2px dashed #c48b2b; background: #fff5df; }
+    .token.protected { border-top: 1px dotted #73969c; }
+    .token.active { outline: 2px solid var(--group-color, var(--accent)); outline-offset: 1px; }
+    .aligned-text.has-active .token:not(.active) { opacity: .35; }
+    .legend { margin: 12px 0; color: var(--muted); font-size: 12px; }
+    .legend span { border-bottom: 2px dashed #c48b2b; padding-bottom: 2px; }
+    .table-scroll { overflow-x: auto; margin-top: 16px; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+    th { background: #f5f8f8; color: var(--muted); font-size: 11px; font-weight: 600; white-space: nowrap; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid #edf1f1; vertical-align: top; }
+    tr:last-child td { border-bottom: 0; } tr.active td { background: #eef8f5; }
+    td.phrase { min-width: 140px; max-width: 330px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .group-button { border: 0; border-radius: 5px; background: var(--group-bg); color: var(--group-color); font-weight: 700; padding: 2px 8px; }
+    .score { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .unaligned-note { font-size: 12px; color: #94621a; margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    pre { overflow: auto; max-height: 440px; background: #102e34; color: #d5ece9; border-radius: 8px; padding: 18px; font-size: 12px; tab-size: 2; }
+    .json-panel { margin-top: 20px; } footer { margin-top: 24px; font-size: 12px; color: var(--muted); }
+    @media (max-width: 720px) {
+      header { padding: 25px 18px; } main { padding: 0 14px; margin-top: 18px; }
+      .panel, .result-card { padding: 18px; } .settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pair-inputs, .text-columns { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+      .aligned-text { font-size: 16px; } .actions > div { width: 100%; } .primary { flex: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">WORD ALIGNER / INTERACTIVE DEMO</div>
+    <h1>让双语之间的对应关系，一目了然。</h1>
+    <p>输入原文与译文，查看词语、短语和未对齐内容。</p>
+  </header>
+  <main>
+    <section class="panel" aria-labelledby="input-title">
+      <form id="align-form">
+        <fieldset id="form-fields">
+          <div class="heading">
+            <h2 id="input-title">01 / 输入句对</h2>
+            <button class="button" id="example" type="button">填入示例</button>
+          </div>
+          <div class="settings">
+            <label>原文语种<select id="source-language" required disabled><option value="">正在加载语种…</option></select></label>
+            <label>译文语种<select id="target-language" required disabled><option value="">正在加载语种…</option></select></label>
+            <label>对齐方法<select id="method"><option value="itermax">itermax · 均衡</option><option value="inter">inter · 保守</option><option value="mwmf">mwmf · 最大权匹配</option></select></label>
+            <label>修正策略<select id="repair"><option value="conservative">conservative · 保守修正</option><option value="span-aware">span-aware · 短语扩展</option><option value="none">不修正 · 原始模型结果</option></select></label>
+          </div>
+          <p class="hint"><span id="language-hint" role="status" aria-live="polite">正在从 /api/v1/languages 加载支持的语种…</span> <button id="retry-languages" class="quiet" type="button" hidden>重试加载语种</button></p>
+          <div id="pairs"></div>
+          <div class="actions">
+            <button class="button" id="add-pair" type="button">＋ 添加句对</button>
+            <span class="hint">每对文本独立对齐 · 最多 100 对</span>
+          </div>
+          <details>
+            <summary>接口设置</summary>
+            <label class="endpoint">对齐接口地址<input id="endpoint" type="text" value="/api/v1/align" required spellcheck="false"></label>
+            <p class="hint">默认调用当前服务的 /api/v1/align。本机测试地址为 http://localhost:8000/api/v1/align。跨域调用需要目标服务允许 CORS；建议通过服务的 /demo 访问本页。</p>
+          </details>
+        </fieldset>
+        <div class="actions">
+          <p class="hint">首次请求可能需要等待模型加载，可随时取消等待。</p>
+          <div>
+            <button class="button" id="cancel" type="button" hidden>取消等待</button>
+            <button class="button primary" id="submit" type="submit" disabled>开始对齐 →</button>
+          </div>
+        </div>
+        <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+      </form>
+    </section>
+    <div class="empty" id="empty"><strong>对齐结果将在这里显示</strong>提交句对后，悬停、聚焦或点击词语，查看对应的译文与分组。</div>
+    <section id="results" aria-labelledby="results-title" hidden>
+      <div class="heading results-header"><h2 id="results-title">02 / 对齐结果</h2><button class="button" id="download" type="button">下载结果 JSON</button></div>
+      <p class="hint" id="result-meta"></p>
+      <div id="sentence-results"></div>
+      <details class="json-panel"><summary>查看请求 JSON</summary><pre id="request-json"></pre></details>
+      <details class="json-panel"><summary>查看响应 JSON</summary><pre id="response-json"></pre></details>
+    </section>
+    <footer>相同颜色表示同一对齐组；置信度为模型估算值，尚未经人工标注集校准。短语组可能没有原子链接，仍会按组完整展示。</footer>
+  </main>
+  <template id="pair-template">
+    <div class="pair-editor">
+      <div class="pair-heading"><strong class="pair-title"></strong><button class="quiet remove-pair" type="button">移除</button></div>
+      <div class="pair-inputs">
+        <label>原文<textarea class="source" dir="auto" required maxlength="10000" placeholder="输入原文，保留原有空格与换行…"></textarea></label>
+        <label>译文<textarea class="target" dir="auto" required maxlength="10000" placeholder="输入与原文对应的译文…"></textarea></label>
+      </div>
+    </div>
+  </template>
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const palette = [
+      ["#087f78", "#dff3ee"], ["#6654b6", "#eee9fc"], ["#a45922", "#fcf0df"],
+      ["#256baf", "#e4f0fc"], ["#a14478", "#f8e8f1"], ["#607c29", "#edf3dc"],
+      ["#ab4d42", "#fcebe6"], ["#3f6e7d", "#e4f0f2"]
+    ];
+    const typeNames = { "one-to-one": "一对一", "one-to-many": "一对多", "many-to-one": "多对一", "many-to-many": "多对多" };
+    const originNames = { model: "模型", rule: "规则", repaired: "补充修正", refined: "短语精炼", mixed: "混合" };
+    let activeRequest = null;
+    let lastResponse = null;
+    let languageVersion = 0;
+    let languagesReady = false;
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function showStatus(message, state) {
+      $("status").textContent = message;
+      $("status").dataset.state = state;
+      $("status").hidden = false;
+    }
+
+    function renumberPairs() {
+      const pairs = [...$("pairs").children];
+      pairs.forEach((pair, index) => {
+        pair.querySelector(".pair-title").textContent = `句对 ${String(index + 1).padStart(2, "0")}`;
+        pair.querySelector(".remove-pair").disabled = pairs.length === 1;
+      });
+      $("add-pair").disabled = pairs.length >= 100;
+    }
+
+    function addPair(source = "", target = "") {
+      if ($("pairs").children.length >= 100) return;
+      const pair = $("pair-template").content.firstElementChild.cloneNode(true);
+      pair.querySelector(".source").value = source;
+      pair.querySelector(".target").value = target;
+      pair.querySelector(".remove-pair").addEventListener("click", () => { pair.remove(); renumberPairs(); });
+      pair.querySelectorAll("textarea").forEach((input) => input.addEventListener("input", () => input.setCustomValidity("")));
+      $("pairs").append(pair);
+      renumberPairs();
+      return pair;
+    }
+
+    function loadExample() {
+      $("pairs").replaceChildren();
+      if ([...$("source-language").options].some((option) => option.value === "en")) $("source-language").value = "en";
+      if ([...$("target-language").options].some((option) => option.value === "zh-Hans")) $("target-language").value = "zh-Hans";
+      addPair("This is a machine translation example.", "这是一个机器翻译示例。");
+      addPair("Keep [[T1504_1]] unchanged.", "保持 [[T1504_1]] 不变。");
+    }
+
+    function endpointURL() {
+      const url = new URL($("endpoint").value.trim(), location.href);
+      if (!["http:", "https:"].includes(url.protocol)) throw new Error("请输入 http 或 https 接口地址，或通过服务的 /demo 访问本页。");
+      return url;
+    }
+
+    async function loadLanguages() {
+      const version = ++languageVersion;
+      const selectors = [$("source-language"), $("target-language")];
+      const selected = selectors.map((select, index) => select.value || ["en", "zh-Hans"][index]);
+      languagesReady = false;
+      $("submit").disabled = true;
+      $("retry-languages").hidden = true;
+      $("language-hint").textContent = "正在从 /api/v1/languages 加载支持的语种…";
+      selectors.forEach((select) => { select.disabled = true; });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        const url = endpointURL();
+        url.pathname = url.pathname.replace(/\/align\/?$/, "/languages");
+        if (!/\/languages$/.test(url.pathname)) throw new Error("自定义接口");
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error("语种列表不可用");
+        const data = await response.json();
+        if (!Array.isArray(data.languages) || !data.languages.length || !data.languages.every((language) =>
+          typeof language.code === "string" && language.code && typeof language.native_name === "string" && typeof language.name === "string"
+        )) throw new Error("语种列表为空或格式不正确");
+        if (version !== languageVersion) return;
+        selectors.forEach((select, index) => {
+          select.replaceChildren(...data.languages.map((language) => {
+            const option = element("option", "", `${language.native_name} · ${language.name} (${language.code})`);
+            option.value = language.code;
+            return option;
+          }));
+          select.value = data.languages.some((language) => language.code === selected[index]) ? selected[index] : data.languages[0].code;
+          select.disabled = false;
+        });
+        languagesReady = true;
+        $("language-hint").textContent = `已从 /api/v1/languages 加载 ${data.languages.length} 种语种。`;
+      } catch (error) {
+        if (version === languageVersion) {
+          selectors.forEach((select) => {
+            const option = element("option", "", "语种加载失败"); option.value = "";
+            select.replaceChildren(option);
+          });
+          $("language-hint").textContent = "无法加载支持的语种，请检查接口地址与服务状态后重试。";
+          $("retry-languages").hidden = false;
+        }
+      } finally {
+        clearTimeout(timer);
+        if (version === languageVersion) $("submit").disabled = Boolean(activeRequest) || !languagesReady;
+      }
+    }
+
+    function applyColor(node, groupIndex) {
+      const [color, background] = palette[groupIndex % palette.length];
+      node.style.setProperty("--group-color", color);
+      node.style.setProperty("--group-bg", background);
+    }
+
+    function groupPhrase(sentence, side, indices) {
+      const tokens = new Map(sentence[`${side}_tokens`].map((token) => [token.index, token]));
+      const selected = [...indices].sort((a, b) => a - b).map((index) => tokens.get(index)).filter(Boolean);
+      if (!selected.length) return "∅";
+      if (selected.every((token, index) => index === 0 || token.index === selected[index - 1].index + 1)) {
+        return Array.from(sentence[side]).slice(selected[0].start, selected[selected.length - 1].end).join("");
+      }
+      return selected.map((token) => token.text).join(" … ");
+    }
+
+    function renderSentence(sentence, position) {
+      const groups = sentence.alignment_groups;
+      const card = element("article", "result-card");
+      const heading = element("div", "result-heading");
+      heading.append(element("h3", "", `句对 ${position + 1}${sentence.id ? ` · ${sentence.id}` : ""}`));
+      heading.append(element("span", "badge", `${groups.length} 个对齐组 · ${sentence.links.length} 条原子链接`));
+      card.append(heading);
+      let pinned = [];
+      let hovered = null;
+      let focused = null;
+      const interactive = [];
+      const textBlocks = [];
+      function highlight() {
+        const selected = new Set(hovered ?? focused ?? pinned);
+        interactive.forEach(({ node, ids }) => {
+          const active = ids.some((id) => selected.has(id));
+          node.classList.toggle("active", active);
+          if (node.tagName === "BUTTON") node.setAttribute("aria-pressed", String(ids.some((id) => pinned.includes(id))));
+        });
+        textBlocks.forEach((node) => node.classList.toggle("has-active", selected.size > 0));
+      }
+      function connect(node, ids) {
+        interactive.push({ node, ids });
+        node.addEventListener("mouseenter", () => { hovered = ids; highlight(); });
+        node.addEventListener("mouseleave", () => { hovered = null; highlight(); });
+        node.addEventListener("focusin", () => { focused = ids; highlight(); });
+        node.addEventListener("focusout", () => { focused = null; highlight(); });
+        node.addEventListener("click", () => {
+          pinned = ids.length === pinned.length && ids.every((id) => pinned.includes(id)) ? [] : ids;
+          highlight();
+        });
+      }
+      card.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") { pinned = []; hovered = null; focused = null; highlight(); }
+      });
+      const columns = element("div", "text-columns");
+      for (const [side, label] of [["source", "SOURCE / 原文"], ["target", "TARGET / 译文"]]) {
+        const block = element("div", "text-block");
+        block.append(element("div", "text-label", label));
+        const text = element("div", "aligned-text");
+        text.dir = "auto";
+        textBlocks.push(text);
+        // Python offsets count Unicode code points. Array.from also handles non-BMP characters.
+        const characters = Array.from(sentence[side]);
+        let cursor = 0;
+        const unaligned = new Set(sentence[`unaligned_${side}_indices`]);
+        for (const token of sentence[`${side}_tokens`]) {
+          text.append(document.createTextNode(characters.slice(cursor, token.start).join("")));
+          const ids = groups.flatMap((group, index) => group[`${side}_indices`].includes(token.index) ? [index] : []);
+          const node = element("button", "token", characters.slice(token.start, token.end).join(""));
+          node.type = "button";
+          node.classList.toggle("unaligned", unaligned.has(token.index));
+          node.classList.toggle("protected", Boolean(token.is_protected));
+          if (ids.length) applyColor(node, ids[0]);
+          node.title = `Token ${token.index} · 字符 [${token.start}, ${token.end}) · ${ids.length ? `对齐组 ${ids.map((id) => id + 1).join(", ")}` : "未对齐"}${token.is_protected ? " · 受保护内容" : ""}`;
+          node.setAttribute("aria-label", `${token.text}，${ids.length ? `对齐组 ${ids.map((id) => id + 1).join(", ")}` : "未对齐"}`);
+          connect(node, ids);
+          text.append(node);
+          cursor = token.end;
+        }
+        text.append(document.createTextNode(characters.slice(cursor).join("")));
+        block.append(text);
+        columns.append(block);
+      }
+      card.append(columns);
+      const legend = element("p", "legend", "悬停或聚焦以联动高亮；点击锁定，再次点击取消，Esc 清除。 ");
+      legend.append(element("span", "", "虚线底纹 = 未对齐"));
+      card.append(legend);
+      if (groups.length) {
+        const scroll = element("div", "table-scroll");
+        const table = element("table");
+        table.setAttribute("aria-label", `句对 ${position + 1} 的对齐分组`);
+        const head = element("thead");
+        const headRow = element("tr");
+        for (const title of ["组", "原文", "译文", "类型 / 来源", "相似度", "置信度"]) {
+          const cell = element("th", "", title); cell.scope = "col"; headRow.append(cell);
+        }
+        head.append(headRow);
+        const body = element("tbody");
+        groups.forEach((group, index) => {
+          const row = element("tr");
+          const number = element("td");
+          const button = element("button", "group-button", String(index + 1).padStart(2, "0"));
+          button.type = "button";
+          button.setAttribute("aria-label", `锁定对齐组 ${index + 1}`);
+          applyColor(button, index);
+          number.append(button);
+          row.append(number);
+          for (const side of ["source", "target"]) {
+            const cell = element("td", "phrase", groupPhrase(sentence, side, group[`${side}_indices`]));
+            cell.dir = "auto"; row.append(cell);
+          }
+          const kind = element("td");
+          kind.append(element("div", "", typeNames[group.type] || group.type));
+          kind.append(element("span", "muted", originNames[group.origin] || group.origin));
+          if (group.links.length === 0) kind.append(element("div", "hint", "仅短语组，无原子链接"));
+          row.append(kind);
+          row.append(element("td", "score", `${(group.similarity * 100).toFixed(1)}%`));
+          row.append(element("td", "score", `${(group.confidence * 100).toFixed(1)}%`));
+          connect(row, [index]);
+          interactive.push({ node: button, ids: [index] });
+          body.append(row);
+        });
+        table.append(head, body); scroll.append(table); card.append(scroll);
+      } else {
+        card.append(element("p", "muted", "此句对未返回对齐分组，请检查下方未对齐内容或尝试其他方法。"));
+      }
+      for (const [side, label] of [["source", "原文"], ["target", "译文"]]) {
+        const indices = sentence[`unaligned_${side}_indices`];
+        if (indices.length) card.append(element("p", "unaligned-note", `${label}未对齐（${indices.length}）：${groupPhrase(sentence, side, indices)}`));
+      }
+      highlight();
+      return card;
+    }
+
+    function errorMessage(data, status) {
+      if (Array.isArray(data?.detail)) {
+        return `HTTP ${status}\n` + data.detail.map((item) => `${(item.loc || []).join(".")}: ${item.msg}`).join("\n");
+      }
+      return `HTTP ${status}：${data?.message || data?.detail || data?.error || "接口请求失败，请检查服务日志。"}`;
+    }
+
+    $("align-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (activeRequest || !languagesReady) return;
+      const pairs = [...$("pairs").children];
+      for (const pair of pairs) {
+        for (const input of pair.querySelectorAll("textarea")) {
+          if (!input.value.trim()) { input.setCustomValidity("请输入至少一个非空白字符。"); input.reportValidity(); return; }
+        }
+      }
+      const payload = {
+        source_language: $("source-language").value.trim(), target_language: $("target-language").value.trim(),
+        method: $("method").value,
+        sentence_pairs: pairs.map((pair, index) => ({ id: `sentence-${index + 1}`, source: pair.querySelector(".source").value, target: pair.querySelector(".target").value }))
+      };
+      if ($("repair").value !== "none") payload.repair = { enabled: true, strategy: $("repair").value };
+      const controller = new AbortController();
+      activeRequest = controller;
+      $("form-fields").disabled = true;
+      $("submit").disabled = true;
+      $("cancel").hidden = false;
+      $("results").hidden = true;
+      $("empty").hidden = true;
+      lastResponse = null;
+      showStatus("正在对齐，请稍候… 首次请求可能需要加载模型。", "loading");
+      const started = performance.now();
+      try {
+        const response = await fetch(endpointURL(), {
+          method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify(payload), signal: controller.signal
+        });
+        const raw = await response.text();
+        let data;
+        try { data = JSON.parse(raw); }
+        catch { throw new Error(`HTTP ${response.status}：接口未返回有效 JSON，请检查接口地址和服务状态。`); }
+        if (!response.ok) throw new Error(errorMessage(data, response.status));
+        if (!Array.isArray(data?.sentence_alignments)) throw new Error("接口响应缺少 sentence_alignments，请确认调用的是 /api/v1/align。");
+        $("sentence-results").replaceChildren(...data.sentence_alignments.map(renderSentence));
+        $("request-json").textContent = JSON.stringify(payload, null, 2);
+        $("response-json").textContent = JSON.stringify(data, null, 2);
+        $("result-meta").textContent = `${data.source_language} → ${data.target_language} · ${data.model} · ${data.method} · Embedding 层 ${data.embedding_layer} · 置信度 ${data.confidence_method}`;
+        lastResponse = data;
+        $("results").hidden = false;
+        showStatus(`对齐完成：${data.sentence_alignments.length} 个句对，用时 ${((performance.now() - started) / 1000).toFixed(2)} 秒。`, "success");
+      } catch (error) {
+        $("empty").hidden = false;
+        showStatus(controller.signal.aborted ? "已取消等待。服务端可能仍在处理本次请求。" : error instanceof TypeError ? "无法连接接口。请检查服务地址、网络和 CORS 设置；建议通过 http://localhost:8000/demo 访问页面。" : error.message, controller.signal.aborted ? "idle" : "error");
+      } finally {
+        activeRequest = null;
+        $("form-fields").disabled = false;
+        $("submit").disabled = !languagesReady;
+        $("cancel").hidden = true;
+      }
+    });
+
+    $("cancel").addEventListener("click", () => activeRequest?.abort());
+    $("add-pair").addEventListener("click", () => addPair().querySelector("textarea").focus());
+    $("example").addEventListener("click", loadExample);
+    $("endpoint").addEventListener("change", loadLanguages);
+    $("retry-languages").addEventListener("click", loadLanguages);
+    $("download").addEventListener("click", () => {
+      if (!lastResponse) return;
+      const url = URL.createObjectURL(new Blob([JSON.stringify(lastResponse, null, 2)], { type: "application/json;charset=utf-8" }));
+      const link = element("a"); link.href = url; link.download = "alignment-result.json";
+      document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    if (location.protocol === "file:") $("endpoint").value = "http://localhost:8000/api/v1/align";
+    addPair("This is a machine translation example.", "这是一个机器翻译示例。");
+    loadLanguages();
+  </script>
+</body>
+</html>
