@@ -159,6 +159,13 @@ def refine_alignment_spans(
             current_links,
             min_span_coverage=min_span_coverage,
         )
+        collapse_disordered_region = has_low_coverage and _should_collapse_disordered_region(
+            region,
+            region_links,
+            link_confidences,
+            locked_links=locked_link_set,
+            min_anchor_confidence=min_anchor_confidence,
+        )
         crossing_spans = _find_local_crossing_spans(
             region,
             region_links,
@@ -193,7 +200,9 @@ def refine_alignment_spans(
         if not has_low_coverage and not crossing_spans:
             continue
 
-        if crossing_spans:
+        if collapse_disordered_region:
+            spans_to_refine = [(region.source_indices, region.target_indices)]
+        elif crossing_spans:
             spans_to_refine = list(crossing_spans)
         elif bounded_gaps_restore_coverage:
             spans_to_refine = list(bounded_gap_spans)
@@ -414,6 +423,42 @@ def _region_coverage(
         len(aligned_source) / len(region.source_indices),
         len(aligned_target) / len(region.target_indices),
     )
+
+
+def _should_collapse_disordered_region(
+    region: _ClauseRegion,
+    region_links: set[RawLink],
+    link_confidences: Mapping[RawLink, float],
+    *,
+    locked_links: set[RawLink],
+    min_anchor_confidence: float,
+) -> bool:
+    """Prefer one honest phrase group over weak, globally scrambled token links."""
+
+    if len(region.source_indices) + len(region.target_indices) > MAX_LOCAL_SEGMENTATION_TOKENS:
+        return False
+    if len(region_links) < 4 or region_links.intersection(locked_links):
+        return False
+
+    boundary_lock_confidence = max(0.55, min_anchor_confidence + 0.10)
+    if any(link_confidences.get(link, 0.0) >= boundary_lock_confidence for link in region_links):
+        return False
+
+    ordered_links = sorted(region_links)
+    comparable_pairs = 0
+    inverted_pairs = 0
+    for index, (first_source, first_target) in enumerate(ordered_links):
+        for second_source, second_target in ordered_links[index + 1 :]:
+            if first_source == second_source or first_target == second_target:
+                continue
+            comparable_pairs += 1
+            if first_source < second_source and first_target > second_target:
+                inverted_pairs += 1
+
+    source_coverage, target_coverage = _region_coverage(region, region_links)
+    has_severe_coverage_gap = min(source_coverage, target_coverage) < 0.5
+    has_global_order_conflict = comparable_pairs > 0 and inverted_pairs / comparable_pairs >= 0.25
+    return has_severe_coverage_gap or has_global_order_conflict
 
 
 def _spans_restore_region_coverage(

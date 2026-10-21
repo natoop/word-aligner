@@ -61,6 +61,11 @@ def _availability_clause_tokenize(value: str):
         yield match.group(), match.start(), match.end()
 
 
+def _callback_reorder_tokenize(value: str):
+    for match in re.finditer(r"克隆|节点|插入|原树|之前|触发|的|回调|。", value):
+        yield match.group(), match.start(), match.end()
+
+
 class StubBackend:
     def __init__(
         self,
@@ -435,6 +440,60 @@ def test_conservative_repair_segments_a_long_clause_into_local_monotonic_spans()
     assert all(group.links == [] for group in refined_groups)
     assert result.alignment_groups[-2].source_tokens == ["example"]
     assert result.alignment_groups[-2].target_tokens == ["示例"]
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == []
+
+
+def test_conservative_repair_uses_whole_clause_for_ambiguous_non_monotonic_reorder() -> None:
+    source = "Callback triggered before the cloned node is inserted into the original tree."
+    target = "克隆节点插入原树之前触发的回调。"
+    links = {(0, 0), (1, 1), (2, 4), (4, 3), (5, 7), (6, 6), (7, 2), (10, 5), (12, 8)}
+    similarities = np.full((13, 9), 0.85, dtype=float)
+    for source_index, target_index in links:
+        similarities[source_index, target_index] = 0.90
+
+    # High, nearly indistinguishable token vectors model embeddings that do
+    # not provide trustworthy local phrase boundaries for this reordering.
+    backend = StubBackend(
+        links,
+        {"mwmf": links},
+        similarities=similarities.tolist(),
+        source_embeddings=[[1.0, 0.0]] * 13,
+        target_embeddings=[[1.0, 0.0]] * 9,
+    )
+    service = AlignmentService(
+        Settings(),
+        tokenizer=WordTokenizer(chinese_tokenize=_callback_reorder_tokenize),
+        backend_factory=lambda: backend,
+    )
+    request = AlignmentRequest.model_validate(
+        {
+            "source_language": "en",
+            "target_language": "zh-Hans",
+            "method": "mwmf",
+            "repair": {
+                "enabled": True,
+                "strategy": "conservative",
+                "max_source_span": 3,
+                "max_target_span": 6,
+                "min_span_coverage": 0.75,
+            },
+            "sentence_pairs": [{"source": source, "target": target}],
+        }
+    )
+
+    result = service.align(request).sentence_alignments[0]
+
+    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
+    assert len(refined_groups) == 1
+    assert refined_groups[0].type == "many-to-many"
+    assert refined_groups[0].source_indices == list(range(12))
+    assert refined_groups[0].target_indices == list(range(8))
+    assert refined_groups[0].links == []
+    assert not any(
+        group.source_indices == [5, 6] and group.target_indices == [6, 7] for group in result.alignment_groups
+    )
+    assert [(link.source_index, link.target_index) for link in result.links] == [(12, 8)]
     assert result.unaligned_source_indices == []
     assert result.unaligned_target_indices == []
 
