@@ -4,11 +4,12 @@ import math
 import unicodedata
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from app.schemas import Token
+from app.temporal_reordering import refine_temporal_reordering
 
 RawLink = tuple[int, int]
 ScoreMatrix = Sequence[Sequence[float]]
@@ -31,6 +32,7 @@ class SpanRefinement:
     links: frozenset[RawLink]
     groups: tuple[RefinedSpan, ...]
     grouped_links: frozenset[RawLink]
+    repaired_links: frozenset[RawLink] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +148,7 @@ def refine_alignment_spans(
 
     groups: list[RefinedSpan] = list(soft_refinement.groups)
     refined_regions: set[SpanIndices] = set()
+    inferred_links: set[RawLink] = set()
 
     for region in regions:
         if set(region.source_indices).intersection(soft_refinement.claimed_source):
@@ -159,12 +162,22 @@ def refine_alignment_spans(
             current_links,
             min_span_coverage=min_span_coverage,
         )
-        collapse_disordered_region = has_low_coverage and _should_collapse_disordered_region(
-            region,
-            region_links,
-            link_confidences,
-            locked_links=locked_link_set,
-            min_anchor_confidence=min_anchor_confidence,
+        reordered_spans = (
+            refine_temporal_reordering(
+                source_tokens,
+                target_tokens,
+                region.source_indices,
+                region.target_indices,
+                span_similarity=lambda source, target: _span_similarity(
+                    source, target, similarities, source_embeddings, target_embeddings
+                ),
+                min_similarity=min_similarity,
+                max_source_span=max_source_span,
+                max_target_span=max_target_span,
+            )
+            if len(region.source_indices) + len(region.target_indices) <= MAX_LOCAL_SEGMENTATION_TOKENS
+            and not region_links.intersection(locked_link_set)
+            else ()
         )
         crossing_spans = _find_local_crossing_spans(
             region,
@@ -197,11 +210,11 @@ def refine_alignment_spans(
             bounded_gap_spans,
             min_span_coverage=min_span_coverage,
         )
-        if not has_low_coverage and not crossing_spans:
+        if not has_low_coverage and not crossing_spans and not reordered_spans:
             continue
 
-        if collapse_disordered_region:
-            spans_to_refine = [(region.source_indices, region.target_indices)]
+        if reordered_spans:
+            spans_to_refine = list(reordered_spans)
         elif crossing_spans:
             spans_to_refine = list(crossing_spans)
         elif bounded_gaps_restore_coverage:
@@ -228,7 +241,7 @@ def refine_alignment_spans(
         if not spans_to_refine:
             continue
 
-        groups.extend(
+        new_groups = [
             _make_refined_span(
                 source_indices,
                 target_indices,
@@ -241,15 +254,36 @@ def refine_alignment_spans(
                 target_embeddings=target_embeddings,
             )
             for source_indices, target_indices in spans_to_refine
-        )
+        ]
+        if reordered_spans:
+            new_groups = [
+                replace(
+                    group,
+                    links=tuple(
+                        (source_index, target_index)
+                        for source_index in group.source_indices
+                        for target_index in group.target_indices
+                    ),
+                )
+                for group in new_groups
+            ]
+        groups.extend(new_groups)
         refined_source = {source_index for source_indices, _ in spans_to_refine for source_index in source_indices}
         refined_target = {target_index for _, target_indices in spans_to_refine for target_index in target_indices}
+        if reordered_spans:
+            # Remove stale links incident to grammatical null tokens as well.
+            refined_source.update(region.source_indices)
+            refined_target.update(region.target_indices)
         current_links = {
             link for link in current_links if link[0] not in refined_source and link[1] not in refined_target
         }
+        if reordered_spans:
+            new_links = {link for group in new_groups for link in group.links}
+            current_links.update(new_links)
+            inferred_links.update(new_links)
         refined_regions.add((region.source_indices, region.target_indices))
 
-    grouped_links: set[RawLink] = set()
+    grouped_links: set[RawLink] = set(inferred_links)
     if strategy == "span-aware":
         expansions = _find_span_expansions(
             regions=[
@@ -274,6 +308,7 @@ def refine_alignment_spans(
         links=frozenset(current_links),
         groups=tuple(groups),
         grouped_links=frozenset(grouped_links),
+        repaired_links=frozenset(inferred_links),
     )
 
 
@@ -423,42 +458,6 @@ def _region_coverage(
         len(aligned_source) / len(region.source_indices),
         len(aligned_target) / len(region.target_indices),
     )
-
-
-def _should_collapse_disordered_region(
-    region: _ClauseRegion,
-    region_links: set[RawLink],
-    link_confidences: Mapping[RawLink, float],
-    *,
-    locked_links: set[RawLink],
-    min_anchor_confidence: float,
-) -> bool:
-    """Prefer one honest phrase group over weak, globally scrambled token links."""
-
-    if len(region.source_indices) + len(region.target_indices) > MAX_LOCAL_SEGMENTATION_TOKENS:
-        return False
-    if len(region_links) < 4 or region_links.intersection(locked_links):
-        return False
-
-    boundary_lock_confidence = max(0.55, min_anchor_confidence + 0.10)
-    if any(link_confidences.get(link, 0.0) >= boundary_lock_confidence for link in region_links):
-        return False
-
-    ordered_links = sorted(region_links)
-    comparable_pairs = 0
-    inverted_pairs = 0
-    for index, (first_source, first_target) in enumerate(ordered_links):
-        for second_source, second_target in ordered_links[index + 1 :]:
-            if first_source == second_source or first_target == second_target:
-                continue
-            comparable_pairs += 1
-            if first_source < second_source and first_target > second_target:
-                inverted_pairs += 1
-
-    source_coverage, target_coverage = _region_coverage(region, region_links)
-    has_severe_coverage_gap = min(source_coverage, target_coverage) < 0.5
-    has_global_order_conflict = comparable_pairs > 0 and inverted_pairs / comparable_pairs >= 0.25
-    return has_severe_coverage_gap or has_global_order_conflict
 
 
 def _spans_restore_region_coverage(

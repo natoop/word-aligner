@@ -378,6 +378,15 @@ class AlignmentService:
                 links = set(span_refinement.links)
                 refined_spans = span_refinement.groups
                 grouped_links = set(span_refinement.grouped_links)
+                for span in refined_spans:
+                    for link in span.links:
+                        if link in span_refinement.repaired_links:
+                            source_index, target_index = link
+                            link_origins[link] = "repaired"
+                            link_scores[link] = LinkScore(
+                                similarity=embedding_result.similarities[source_index][target_index],
+                                confidence=span.confidence,
+                            )
 
             sentence_alignments.append(
                 _build_sentence_alignment(

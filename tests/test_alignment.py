@@ -62,7 +62,7 @@ def _availability_clause_tokenize(value: str):
 
 
 def _callback_reorder_tokenize(value: str):
-    for match in re.finditer(r"克隆|节点|插入|原树|之前|触发|的|回调|。", value):
+    for match in re.finditer(r"克隆|节点|插入|原树|之前|之后|时|触发|的|回调|。", value):
         yield match.group(), match.start(), match.end()
 
 
@@ -444,32 +444,93 @@ def test_conservative_repair_segments_a_long_clause_into_local_monotonic_spans()
     assert result.unaligned_target_indices == []
 
 
-def test_conservative_repair_uses_whole_clause_for_ambiguous_non_monotonic_reorder() -> None:
-    source = "Callback triggered before the cloned node is inserted into the original tree."
-    target = "克隆节点插入原树之前触发的回调。"
-    links = {(0, 0), (1, 1), (2, 4), (4, 3), (5, 7), (6, 6), (7, 2), (10, 5), (12, 8)}
-    similarities = np.full((13, 9), 0.85, dtype=float)
-    for source_index, target_index in links:
-        similarities[source_index, target_index] = 0.90
+def _run_callback_temporal_reordering(
+    *,
+    marker: str,
+    target_marker: str,
+    reverse: bool = False,
+):
+    source_english = f"Callback triggered {marker} the cloned node is inserted into the original tree."
+    target_chinese = f"克隆节点插入原树{target_marker}触发的回调。"
+    tokenizer = WordTokenizer(chinese_tokenize=_callback_reorder_tokenize)
+    english_tokens = tokenizer.tokenize(source_english, "en")
+    chinese_tokens = tokenizer.tokenize(target_chinese, "zh-Hans")
 
-    # High, nearly indistinguishable token vectors model embeddings that do
-    # not provide trustworthy local phrase boundaries for this reordering.
+    dimensions = {
+        "callback": 0,
+        "回调": 0,
+        "triggered": 1,
+        "触发": 1,
+        "的": 1,
+        "before": 2,
+        "after": 2,
+        "之前": 2,
+        "之后": 2,
+        "cloned": 3,
+        "克隆": 3,
+        "node": 4,
+        "节点": 4,
+        "inserted": 5,
+        "插入": 5,
+        "original": 6,
+        "tree": 6,
+        "原树": 6,
+    }
+
+    def embeddings(tokens, *, english: bool) -> np.ndarray:
+        rows = np.zeros((len(tokens), 7), dtype=float)
+        for token in tokens:
+            key = token.text.casefold() if english else token.text
+            dimension = dimensions.get(key)
+            if dimension is not None:
+                rows[token.index, dimension] = 1.0
+        return rows
+
+    english_embeddings = embeddings(english_tokens, english=True)
+    chinese_embeddings = embeddings(chinese_tokens, english=False)
+
+    # Make the test scores agree with the semantic embedding vectors so the
+    # path choice is independent of equal-score iteration order.
+    similarities = np.full((len(english_tokens), len(chinese_tokens)), 0.5, dtype=float)
+    for source_index, source_vector in enumerate(english_embeddings):
+        source_norm = float(np.linalg.norm(source_vector))
+        if source_norm == 0.0:
+            continue
+        for target_index, target_vector in enumerate(chinese_embeddings):
+            target_norm = float(np.linalg.norm(target_vector))
+            if target_norm == 0.0:
+                continue
+            cosine = float(np.dot(source_vector, target_vector) / (source_norm * target_norm))
+            similarities[source_index, target_index] = (cosine + 1.0) / 2.0
+
+    # Reproduce the original model's misleading links while keeping its
+    # similarity matrix and contextual vectors semantically distinguishable.
+    english_links = {(0, 0), (1, 1), (2, 4), (4, 3), (5, 7), (6, 6), (7, 2), (10, 5), (12, 8)}
+
+    if reverse:
+        source_text, target_text = target_chinese, source_english
+        source_language, target_language = "zh-Hans", "en"
+        source_embeddings, target_embeddings = chinese_embeddings, english_embeddings
+        similarities = similarities.transpose()
+        links = {(target_index, source_index) for source_index, target_index in english_links}
+    else:
+        source_text, target_text = source_english, target_chinese
+        source_language, target_language = "en", "zh-Hans"
+        source_embeddings, target_embeddings = english_embeddings, chinese_embeddings
+        links = english_links
+
     backend = StubBackend(
         links,
         {"mwmf": links},
         similarities=similarities.tolist(),
-        source_embeddings=[[1.0, 0.0]] * 13,
-        target_embeddings=[[1.0, 0.0]] * 9,
+        source_embeddings=source_embeddings.tolist(),
+        target_embeddings=target_embeddings.tolist(),
     )
-    service = AlignmentService(
-        Settings(),
-        tokenizer=WordTokenizer(chinese_tokenize=_callback_reorder_tokenize),
-        backend_factory=lambda: backend,
-    )
+    service = AlignmentService(Settings(), tokenizer=tokenizer, backend_factory=lambda: backend)
     request = AlignmentRequest.model_validate(
         {
-            "source_language": "en",
-            "target_language": "zh-Hans",
+            "source_language": source_language,
+            "target_language": target_language,
             "method": "mwmf",
             "repair": {
                 "enabled": True,
@@ -478,24 +539,93 @@ def test_conservative_repair_uses_whole_clause_for_ambiguous_non_monotonic_reord
                 "max_target_span": 6,
                 "min_span_coverage": 0.75,
             },
-            "sentence_pairs": [{"source": source, "target": target}],
+            "sentence_pairs": [{"source": source_text, "target": target_text}],
         }
     )
+    return service.align(request).sentence_alignments[0]
 
-    result = service.align(request).sentence_alignments[0]
 
-    refined_groups = [group for group in result.alignment_groups if group.origin == "refined"]
-    assert len(refined_groups) == 1
-    assert refined_groups[0].type == "many-to-many"
-    assert refined_groups[0].source_indices == list(range(12))
-    assert refined_groups[0].target_indices == list(range(8))
-    assert refined_groups[0].links == []
-    assert not any(
-        group.source_indices == [5, 6] and group.target_indices == [6, 7] for group in result.alignment_groups
-    )
-    assert [(link.source_index, link.target_index) for link in result.links] == [(12, 8)]
-    assert result.unaligned_source_indices == []
+@pytest.mark.parametrize(("marker", "target_marker"), [("before", "之前"), ("after", "之后")])
+def test_temporal_reordering_produces_word_level_groups(marker: str, target_marker: str) -> None:
+    result = _run_callback_temporal_reordering(marker=marker, target_marker=target_marker)
+
+    _assert_callback_reorder_result(result, marker=marker, target_marker=target_marker)
+    assert result.unaligned_source_indices == [3, 6, 8, 9]
     assert result.unaligned_target_indices == []
+
+
+def test_temporal_reordering_is_symmetric_for_chinese_to_english() -> None:
+    result = _run_callback_temporal_reordering(marker="before", target_marker="之前", reverse=True)
+
+    _assert_callback_reorder_result(result, marker="before", target_marker="之前", reverse=True)
+    assert result.unaligned_source_indices == []
+    assert result.unaligned_target_indices == [3, 6, 8, 9]
+
+
+def _assert_callback_reorder_result(
+    result,
+    *,
+    marker: str,
+    target_marker: str,
+    reverse: bool = False,
+) -> None:
+    expected_links = {
+        (0, 7),
+        (1, 5),
+        (1, 6),
+        (2, 4),
+        (4, 0),
+        (5, 1),
+        (7, 2),
+        (10, 3),
+        (11, 3),
+    }
+    expected_groups = {
+        (("Callback",), ("回调",)),
+        (("triggered",), ("触发", "的")),
+        ((marker,), (target_marker,)),
+        (("cloned",), ("克隆",)),
+        (("node",), ("节点",)),
+        (("inserted",), ("插入",)),
+        (("original", "tree"), ("原树",)),
+    }
+    if reverse:
+        expected_links = {(target_index, source_index) for source_index, target_index in expected_links}
+        expected_groups = {(target_words, source_words) for source_words, target_words in expected_groups}
+
+    assert {(link.source_index, link.target_index, link.origin) for link in result.links} == {
+        (source_index, target_index, "repaired") for source_index, target_index in expected_links
+    } | {(8, 12, "model") if reverse else (12, 8, "model")}
+
+    repaired_groups = [
+        group
+        for group in result.alignment_groups
+        if group.links and all(link.origin == "repaired" for link in group.links)
+    ]
+    assert {(tuple(group.source_tokens), tuple(group.target_tokens)) for group in repaired_groups} == expected_groups
+    assert all(group.links for group in repaired_groups)
+    assert {
+        (link.source_index, link.target_index) for group in repaired_groups for link in group.links
+    } == expected_links
+
+    aligned_source: set[int] = set()
+    aligned_target: set[int] = set()
+    for group in repaired_groups:
+        group_source = set(group.source_indices)
+        group_target = set(group.target_indices)
+        assert aligned_source.isdisjoint(group_source)
+        assert aligned_target.isdisjoint(group_target)
+        aligned_source.update(group_source)
+        aligned_target.update(group_target)
+
+
+def test_temporal_reordering_does_not_make_a_whole_sentence_group_without_a_marker() -> None:
+    result = _run_callback_temporal_reordering(marker="while", target_marker="时")
+
+    assert not any(
+        group.origin == "refined" and group.source_indices == list(range(12)) and group.target_indices == list(range(8))
+        for group in result.alignment_groups
+    )
 
 
 def test_local_monotonic_span_segmentation_is_symmetric() -> None:

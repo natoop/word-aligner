@@ -138,7 +138,7 @@ Compose 项目名为 `word-aligner`，镜像名为 `word-aligner:latest`。模�
 
 两侧覆盖率达到 100% 也不代表 token 角色一定正确。在已有锚点限定的分句内，如果一段连续一对一链接的目标端顺序严格反向，服务会把它收拢成一个局部精炼短语组。至少包含三条证据链接的稀疏严格倒序序列，在不超过两个配置局部 Span 时可以使用其连续包围区间。因此既能把 `原子/链接 → links/atomic` 改为 `原子链接 ↔ atomic links`，也能把 `Programme for the Endorsement of Forest ↔ 森林认证认可计划` 表示为完整短语，同时保留周围稳定链接。
 
-对于由标点限定、至少含四条模型链接，但没有锁定规则链接或达到边界强度链接的区域，保守修复还会检查全局顺序。如果可比较链接对中至少四分之一发生倒序，或任一侧的 token 覆盖率低于一半，服务会认为该区域不足以支持可靠的 token 级关系。只要区域未超过 64-token 安全上限，就会把它作为一个 `origin: "refined"`、`links: []` 的整体短语组返回，标点锚点仍保留为原子链接。例如发生语块换序的 `Callback triggered before ... ↔ ... 之前触发的回调` 会保持语义对齐，同时不再暴露 `Callback ↔ 克隆` 或 `node is ↔ 的回调` 等伪精确链接。
+中英文时间从句换序按词级处理。唯一的 `before ↔ 之前/以前` 或 `after ↔ 之后/以后` 标记可用于划分互换位置的从句，再使用 XLM-R Span Embedding 将各局部区域细分为单词或小范围一对多、多对一关系；仅含两个实词的区域也允许词序反转。没有独立译文的英文冠词、助动词等可以保留未对齐。例如 `Callback triggered before the cloned node is inserted into the original tree.` 会得到 `Callback ↔ 回调`、`triggered ↔ 触发的`、`before ↔ 之前`、`cloned ↔ 克隆`、`node ↔ 节点`、`inserted ↔ 插入` 和 `original tree ↔ 原树`。这些组标记为 `origin: "refined"`，并在组内和句子级 `links` 中提供 `origin: "repaired"` 的明确词级链接；链接相似度保留原始 token 对余弦分数，置信度使用精炼 Span 证据。标点锚点仍保留原子链接；服务不会再将这个歧义区域合并为整句组。此有界规则覆盖上述时间结构，不代表支持任意句法换序。
 
 在漏词修复和 Span 精炼之前，确定性的日期规范化规则会处理年月格式换序。英文月份缩写和全称会规范化为 `month:1`～`month:12`，四位年份以及中文的“数字 + 年”Span 会规范化为 `year:YYYY`，中文的“数字 + 月”Span 会规范化为相同月份键。匹配成功后会移除冲突的模型链接，并生成完整的 `origin: "rule"` 关系。例如 `Feb 2025 ↔ 2025年2月` 会得到 `Feb ↔ [2, 月]` 和 `2025 ↔ [2025, 年]`，规则分数均为 `1.0`，且没有未对齐 token。
 
