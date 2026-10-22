@@ -25,7 +25,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000/demo` for the interactive demo, or `http://localhost:8000/docs` for Swagger UI. The demo sends requests to the same-origin `/api/v1/align` endpoint by default, loads language choices from `GET /api/v1/languages`, supports multiple sentence pairs, highlights grouped alignments, and shows the original JSON response. No supported-language list needs to be entered by hand. The current local test address is `http://localhost:8000`. Serve the page through `/demo` instead of opening the HTML file directly, since browsers may block `file://` requests to the API. You can also run the service with Docker Compose:
+Open `http://localhost:8000/demo` for the interactive demo, or `http://localhost:8000/docs` for Swagger UI. The demo lets you choose the local model or an LLM provider, loads language choices from `GET /api/v1/languages`, and highlights grouped alignments. It uses `/api/v1/align` for the local model and `/api/v1/llm/align` for an LLM. The LLM path does not load XLM-R; the existing local-model endpoint remains available. The current local test address is `http://localhost:8000`. Serve the page through `/demo` instead of opening the HTML file directly, since browsers may block `file://` requests to the API. You can also run the service with Docker Compose:
 
 ```powershell
 docker volume create word-aligner-models
@@ -35,6 +35,8 @@ docker compose up --build
 The Compose project is named `word-aligner`, and the image is `word-aligner:latest`. Models are mounted through the logical `model-cache` volume. To avoid downloading XLM-R again after the project rename, the physical `word-aligner-models` volume is declared external; `docker volume create` is idempotent and does not clear an existing cache.
 
 The checked-in Compose configuration targets an NVIDIA GPU: it builds PyTorch from the CUDA 12.8 wheel index, assigns all available GPUs to the container, and sets `ALIGNER_DEVICE=cuda`. Docker Desktop or Docker Engine must expose the NVIDIA runtime to containers. The Dockerfile itself keeps the CPU wheel index as its default, so a direct `docker build .` remains CPU-oriented. To convert the Compose deployment to CPU, change the build argument to `https://download.pytorch.org/whl/cpu`, remove `gpus: all`, and set `ALIGNER_DEVICE=cpu`.
+
+To configure LLM providers, copy `.env.example` to `.env` and fill in the provider settings described below. Docker Compose 2.24 or newer passes this optional file into the container; without `.env`, the service still starts with no LLM providers. The app also reads the project-root `.env` directly when run outside Docker. Process environment variables take precedence, and changes require an application restart. If you only want to try LLM alignment in the Compose deployment, set `ALIGNER_EAGER_LOAD=false` to skip the local XLM-R warm-up at startup.
 
 Keep the service at one worker per container because every worker loads its own copy of the model. For horizontal scaling, run multiple single-worker containers.
 
@@ -77,6 +79,119 @@ Returns the languages that this service publicly supports for word alignment. An
 ```
 
 The public list includes only languages for which the service has a usable word-tokenization strategy. XLM-R also covers languages such as Japanese and Thai, but they require additional language-specific tokenizers and therefore are not currently advertised as supported.
+
+### `GET /api/v1/llm/providers`
+
+Returns the configured LLM provider choices for the demo. The response contains only provider IDs, display names, and model names; API keys and base URLs are never exposed.
+
+```json
+{
+  "providers": [
+    {"id": "deepseek", "name": "DeepSeek", "model": "deepseek-chat"},
+    {"id": "local", "name": "Local server", "model": "your-local-model"}
+  ],
+  "default_provider": "deepseek"
+}
+```
+
+### `POST /api/v1/llm/align`
+
+This independent endpoint aligns already-translated text through a configured OpenAI-compatible chat-completions API. It does not use the XLM-R model, and its request does not accept the local endpoint's `method` or `repair` fields.
+
+```json
+{
+  "provider": "deepseek",
+  "source_language": "en",
+  "target_language": "zh-Hans",
+  "sentence_pairs": [
+    {"id": "demo", "source": "He gave up.", "target": "他放弃了。"}
+  ]
+}
+```
+
+`provider` is optional when a default provider is configured. The language fields are optional and default to `auto`. Submit 1–10 corresponding sentence pairs; each side may contain up to 10,000 characters. The server splits text into alignment units: Chinese and other scripts without spaces use fine-grained character or grapheme units, while ordinary word runs remain grouped. These are display units, not necessarily linguistic words. Each side of a pair is limited to 1,024 units, with a 4,096-unit total limit across the request; requests over these limits return `422`.
+
+The model returns unit IDs only. The server validates that every source and target unit appears exactly once, either in an alignment or in the explicit unaligned list, and rejects unknown, repeated, or omitted IDs. It then builds the token text, UTF-16 offsets, and grouped alignment response. An unaligned unit means the model did not assign it a counterpart; it does not by itself mean that the translation omitted its meaning.
+
+Response shape (alignment choices and usage below are illustrative):
+
+```json
+{
+  "source_language": "en",
+  "target_language": "zh-Hans",
+  "provider": "deepseek",
+  "provider_name": "DeepSeek",
+  "model": "deepseek-chat",
+  "method": "llm",
+  "offset_unit": "utf16",
+  "confidence_method": null,
+  "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140},
+  "sentence_alignments": [
+    {
+      "index": 0,
+      "id": "demo",
+      "source": "He gave up.",
+      "target": "他放弃了。",
+      "source_tokens": [
+        {"index": 0, "text": "He", "start": 0, "end": 2, "is_protected": false},
+        {"index": 1, "text": "gave", "start": 3, "end": 7, "is_protected": false},
+        {"index": 2, "text": "up", "start": 8, "end": 10, "is_protected": false},
+        {"index": 3, "text": ".", "start": 10, "end": 11, "is_protected": false}
+      ],
+      "target_tokens": [
+        {"index": 0, "text": "他", "start": 0, "end": 1, "is_protected": false},
+        {"index": 1, "text": "放", "start": 1, "end": 2, "is_protected": false},
+        {"index": 2, "text": "弃", "start": 2, "end": 3, "is_protected": false},
+        {"index": 3, "text": "了", "start": 3, "end": 4, "is_protected": false},
+        {"index": 4, "text": "。", "start": 4, "end": 5, "is_protected": false}
+      ],
+      "links": [],
+      "alignment_groups": [
+        {
+          "type": "one-to-one",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [0],
+          "target_indices": [0],
+          "source_tokens": ["He"],
+          "target_tokens": ["他"],
+          "links": []
+        },
+        {
+          "type": "many-to-many",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [1, 2],
+          "target_indices": [1, 2, 3],
+          "source_tokens": ["gave", "up"],
+          "target_tokens": ["放", "弃", "了"],
+          "links": []
+        },
+        {
+          "type": "one-to-one",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [3],
+          "target_indices": [4],
+          "source_tokens": ["."],
+          "target_tokens": ["。"],
+          "links": []
+        }
+      ],
+      "unaligned_source_indices": [],
+      "unaligned_target_indices": [],
+      "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
+    }
+  ]
+}
+```
+
+LLM token offsets are zero-based, half-open UTF-16 code-unit offsets into the unchanged input text, so JavaScript can use them directly for slicing. The response has `method: "llm"`, `offset_unit: "utf16"`, and `confidence_method: null`; groups use `origin: "llm"`, null similarity/confidence, and empty `links`. Per-sentence `usage` comes from the provider. Top-level `usage` sums the provider-reported counts and is `null` if any pair has no usage data.
+
+Errors use `400` for an unknown provider, `422` for invalid or oversized input, `502` for upstream failures or invalid model output, `503` when no provider is configured, and `504` for a provider timeout. A provider rate limit can return `429`.
 
 ### `POST /api/v1/align`
 
@@ -232,6 +347,55 @@ JavaScript string indices use UTF-16 code units. If a non-BMP character such as 
 | `ALIGNER_EAGER_LOAD` | `false` | Load the model during startup when `true`; otherwise load it on the first alignment request |
 | `HF_HOME` | Hugging Face default | Model cache location |
 | `HF_MODEL_UPDATE_POLICY` | `if-missing` | `if-missing` automatically goes offline for a complete cache; also supports `always` and `offline` |
+| `LLM_PROVIDERS` | auto-discovered | Optional comma-separated provider IDs and ordering; when empty or omitted, providers are discovered from their `LLM_<ID>_*` settings. LLM support stays disabled when no providers are configured |
+| `LLM_DEFAULT_PROVIDER` | first configured provider | Optional default provider used when a request omits `provider`; discovered providers are ordered alphabetically |
+| `LLM_TIMEOUT_SECONDS` | `120` | Per-request upstream timeout |
+| `LLM_MAX_OUTPUT_TOKENS` | `8192` | Maximum output tokens requested from the provider |
+
+Each configured provider requires `LLM_<ID>_NAME`, `LLM_<ID>_BASE_URL`, and `LLM_<ID>_MODEL`. It may also set `LLM_<ID>_API_KEY` (optional for local servers) and `LLM_<ID>_RESPONSE_FORMAT` (`json_object`, `json_schema`, or `none`; default `json_object`). If `LLM_PROVIDERS` is empty or omitted, provider IDs are discovered from these uppercase variables and sorted alphabetically; an explicit list takes precedence and preserves its order. Use a base URL such as `https://api.deepseek.com/v1` or `https://api.openai.com/v1`; do not include `/chat/completions`, which the server appends. For OpenAI, set `LLM_OPENAI_MAX_TOKENS_PARAMETER=max_completion_tokens` when needed; the default is `max_tokens`.
+
+Example configuration (use your own secret in the ignored `.env` file, never commit it):
+
+```dotenv
+LLM_PROVIDERS=deepseek,openai,local
+# Optional; defaults to the first listed or discovered provider.
+# LLM_DEFAULT_PROVIDER=deepseek
+LLM_TIMEOUT_SECONDS=120
+LLM_MAX_OUTPUT_TOKENS=8192
+
+LLM_DEEPSEEK_NAME=DeepSeek
+LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+LLM_DEEPSEEK_MODEL=deepseek-chat
+LLM_DEEPSEEK_API_KEY=
+LLM_DEEPSEEK_RESPONSE_FORMAT=json_object
+
+LLM_OPENAI_NAME=OpenAI
+LLM_OPENAI_BASE_URL=https://api.openai.com/v1
+LLM_OPENAI_MODEL=gpt-4.1-mini
+LLM_OPENAI_API_KEY=
+LLM_OPENAI_RESPONSE_FORMAT=json_schema
+LLM_OPENAI_MAX_TOKENS_PARAMETER=max_completion_tokens
+
+LLM_LOCAL_NAME=Local server
+LLM_LOCAL_BASE_URL=http://host.docker.internal:1234/v1
+LLM_LOCAL_MODEL=your-local-model
+LLM_LOCAL_API_KEY=
+LLM_LOCAL_RESPONSE_FORMAT=json_object
+```
+
+The local base URL must be reachable from the API process. When the API runs in Compose, `localhost` refers to the container itself; use a host address such as `host.docker.internal` or a service name on the same Docker network.
+
+For a quick PowerShell call, the demo is available at `/demo`; the API accepts the same JSON shown above:
+
+```powershell
+$body = @{
+  provider = 'deepseek'
+  source_language = 'en'
+  target_language = 'zh-Hans'
+  sentence_pairs = @(@{ id = 'demo'; source = 'He gave up.'; target = '他放弃了。' })
+} | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Uri 'http://localhost:8000/api/v1/llm/align' -Method Post -ContentType 'application/json' -Body $body
+```
 
 ## Testing
 
@@ -242,3 +406,5 @@ pip install -r requirements-dev.txt
 pytest
 ruff check .
 ```
+
+LLM client tests use a mock HTTP transport. No live provider call or real model quality check is implied by this local test suite.

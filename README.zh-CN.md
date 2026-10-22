@@ -25,7 +25,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-打开 `http://localhost:8000/demo` 可使用交互演示页，或打开 `http://localhost:8000/docs` 使用 Swagger UI。演示页默认向同源的 `/api/v1/align` 发送请求，并通过 `GET /api/v1/languages` 加载可选语种，无需手动填写支持语种列表；它还支持提交多个句对、按分组高亮对齐结果并查看原始 JSON。当前本机测试地址为 `http://localhost:8000`。请通过 `/demo` 访问页面，不要直接打开 HTML 文件，因为浏览器可能会阻止 `file://` 页面跨域请求接口。也可以用 Docker Compose：
+打开 `http://localhost:8000/demo` 可使用交互演示页，或打开 `http://localhost:8000/docs` 使用 Swagger UI。演示页可选择本地模型或大模型服务商，并按分组高亮结果。本地模型使用 `/api/v1/align`，大模型使用 `/api/v1/llm/align`；大模型路径不会加载 XLM-R，原有本地模型接口仍可使用。语种列表通过 `GET /api/v1/languages` 加载。当前本机测试地址为 `http://localhost:8000`。请通过 `/demo` 访问页面，不要直接打开 HTML 文件，因为浏览器可能会阻止 `file://` 页面跨域请求接口。也可以用 Docker Compose：
 
 ```powershell
 docker volume create word-aligner-models
@@ -35,6 +35,8 @@ docker compose up --build
 Compose 项目名为 `word-aligner`，镜像名为 `word-aligner:latest`。模型缓存在逻辑卷 `model-cache` 中；为避免项目改名后重复下载 XLM-R，物理卷 `word-aligner-models` 被声明为 external。`docker volume create` 可以安全重复执行，不会清空已有缓存。
 
 仓库中的 Compose 配置默认使用 NVIDIA GPU：从 CUDA 12.8 PyTorch wheel 源构建镜像，将可用 GPU 分配给容器，并设置 `ALIGNER_DEVICE=cuda`。Docker Desktop 或 Docker Engine 必须已经向容器开放 NVIDIA runtime。Dockerfile 自身仍以 CPU wheel 源作为默认值，因此直接执行 `docker build .` 时默认构建 CPU 镜像。若要把 Compose 改为 CPU，需要将构建参数改成 `https://download.pytorch.org/whl/cpu`、移除 `gpus: all`，并把 `ALIGNER_DEVICE` 改为 `cpu`。
+
+配置大模型服务商时，将 `.env.example` 复制为项目根目录下的 `.env` 并填写配置。Docker Compose 2.24 或更高版本会把这个可选文件传入容器；没有 `.env` 时服务仍可启动，只是没有已配置的大模型服务商。非 Docker 启动时，程序也会独立读取项目根目录的 `.env`；进程环境变量优先级更高。修改配置后需要重启服务。如果在 Compose 环境中只想试大模型，可将 `ALIGNER_EAGER_LOAD=false`，避免启动时预热本地 XLM-R。
 
 请保持单 worker，多个 worker 会各自加载一份大模型；需要横向扩容时，更适合启动多个单 worker 容器。
 
@@ -77,6 +79,119 @@ Compose 项目名为 `word-aligner`，镜像名为 `word-aligner:latest`。模�
 ```
 
 当前公开列表只包含已有可用词级切分策略的语种。XLM-R 虽然还覆盖日语、泰语等语种，但这些语言需要额外的专用分词器，因此暂不在接口中声明为受支持。
+
+### `GET /api/v1/llm/providers`
+
+返回演示页可选择的已配置服务商。响应只含服务商 ID、显示名称和模型名，不会暴露 API key 或 BASE_URL。
+
+```json
+{
+  "providers": [
+    {"id": "deepseek", "name": "DeepSeek", "model": "deepseek-chat"},
+    {"id": "local", "name": "本地服务", "model": "your-local-model"}
+  ],
+  "default_provider": "deepseek"
+}
+```
+
+### `POST /api/v1/llm/align`
+
+此独立接口通过已配置的 OpenAI 兼容 Chat Completions API 对已翻译文本进行对齐，不使用 XLM-R，也不接受本地接口的 `method` 或 `repair` 字段。
+
+```json
+{
+  "provider": "deepseek",
+  "source_language": "en",
+  "target_language": "zh-Hans",
+  "sentence_pairs": [
+    {"id": "demo", "source": "He gave up.", "target": "他放弃了。"}
+  ]
+}
+```
+
+`provider` 可省略；此时使用 `LLM_DEFAULT_PROVIDER`，若未设置则使用 `LLM_PROVIDERS` 中的首个服务商。语种字段可省略，默认值为 `auto`。每次提交 1～10 个已有对应关系的句对；每侧文本最多 10,000 字符。服务会把文本切成对齐单元：中文等无空格脚本使用细粒度字符或字素单元，其他常见词串则按词串切分。它们是展示用单元，不一定等同于语言学意义上的词。每个句对的每侧最多 1,024 个单元，整个请求最多 4,096 个单元；超限返回 `422`。
+
+模型只返回单元 ID。服务会校验每侧每个单元恰好出现一次：要么属于某个对齐组，要么明确列在未对齐列表中；未知、重复或遗漏的 ID 都会被拒绝。随后由后端生成 token 文本、UTF-16 位置和分组结果。未对齐表示模型没有为该单元指定对应项，本身不代表译文漏译了其含义。
+
+响应示例（对齐选择和用量为结构示例）：
+
+```json
+{
+  "source_language": "en",
+  "target_language": "zh-Hans",
+  "provider": "deepseek",
+  "provider_name": "DeepSeek",
+  "model": "deepseek-chat",
+  "method": "llm",
+  "offset_unit": "utf16",
+  "confidence_method": null,
+  "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140},
+  "sentence_alignments": [
+    {
+      "index": 0,
+      "id": "demo",
+      "source": "He gave up.",
+      "target": "他放弃了。",
+      "source_tokens": [
+        {"index": 0, "text": "He", "start": 0, "end": 2, "is_protected": false},
+        {"index": 1, "text": "gave", "start": 3, "end": 7, "is_protected": false},
+        {"index": 2, "text": "up", "start": 8, "end": 10, "is_protected": false},
+        {"index": 3, "text": ".", "start": 10, "end": 11, "is_protected": false}
+      ],
+      "target_tokens": [
+        {"index": 0, "text": "他", "start": 0, "end": 1, "is_protected": false},
+        {"index": 1, "text": "放", "start": 1, "end": 2, "is_protected": false},
+        {"index": 2, "text": "弃", "start": 2, "end": 3, "is_protected": false},
+        {"index": 3, "text": "了", "start": 3, "end": 4, "is_protected": false},
+        {"index": 4, "text": "。", "start": 4, "end": 5, "is_protected": false}
+      ],
+      "links": [],
+      "alignment_groups": [
+        {
+          "type": "one-to-one",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [0],
+          "target_indices": [0],
+          "source_tokens": ["He"],
+          "target_tokens": ["他"],
+          "links": []
+        },
+        {
+          "type": "many-to-many",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [1, 2],
+          "target_indices": [1, 2, 3],
+          "source_tokens": ["gave", "up"],
+          "target_tokens": ["放", "弃", "了"],
+          "links": []
+        },
+        {
+          "type": "one-to-one",
+          "origin": "llm",
+          "similarity": null,
+          "confidence": null,
+          "source_indices": [3],
+          "target_indices": [4],
+          "source_tokens": ["."],
+          "target_tokens": ["。"],
+          "links": []
+        }
+      ],
+      "unaligned_source_indices": [],
+      "unaligned_target_indices": [],
+      "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
+    }
+  ]
+}
+```
+
+LLM token 的 `start`/`end` 是相对于原始文本的零基、左闭右开 UTF-16 代码单元偏移，可直接用于 JavaScript 字符串切片。响应固定使用 `method: "llm"`、`offset_unit: "utf16"` 和 `confidence_method: null`；组使用 `origin: "llm"`，相似度/置信度为 `null`，`links` 为空。每句的 `usage` 取自服务商响应；顶层 `usage` 汇总服务商返回的计数，只要任一句缺少用量数据，顶层值就为 `null`。
+
+错误状态码：`400` 表示服务商未知，`422` 表示输入无效或超过单元限制，`502` 表示上游失败或模型输出无效，`503` 表示尚未配置服务商，`504` 表示上游超时。服务商限流时也可能返回 `429`。
 
 ### `POST /api/v1/align`
 
@@ -226,6 +341,55 @@ Compose 项目名为 `word-aligner`，镜像名为 `word-aligner:latest`。模�
 | `ALIGNER_EAGER_LOAD` | `false` | `true` 时在应用启动阶段加载模型；否则第一次对齐时加载 |
 | `HF_HOME` | Hugging Face 默认目录 | 模型缓存位置 |
 | `HF_MODEL_UPDATE_POLICY` | `if-missing` | `if-missing` 缓存完整后自动离线；也可设为 `always` 或 `offline` |
+| `LLM_PROVIDERS` | 自动发现 | 可选的服务商 ID 及顺序，以逗号分隔；留空或省略时，从各服务商的 `LLM_<ID>_*` 配置自动发现。未配置任何服务商时停用大模型接口，本地模型仍可用 |
+| `LLM_DEFAULT_PROVIDER` | 首个已配置服务商 | 可选默认服务商；请求省略 `provider` 时使用。自动发现的服务商按字母顺序排列 |
+| `LLM_TIMEOUT_SECONDS` | `120` | 上游请求超时秒数 |
+| `LLM_MAX_OUTPUT_TOKENS` | `8192` | 请求服务商生成的最大 token 数 |
+
+每个服务商都必须有 `LLM_<ID>_NAME`、`LLM_<ID>_BASE_URL` 和 `LLM_<ID>_MODEL`。`LLM_PROVIDERS` 留空或省略时，服务会从这些大写环境变量自动发现 ID 并按字母顺序排列；显式填写时以该列表及其顺序为准。可选设置 `LLM_<ID>_API_KEY`（本地服务可以留空）和 `LLM_<ID>_RESPONSE_FORMAT`（`json_object`、`json_schema` 或 `none`；默认 `json_object`）。BASE_URL 示例：`https://api.deepseek.com/v1` 或 `https://api.openai.com/v1`；不要添加 `/chat/completions`，服务端会自动拼接。需要时为 OpenAI 设置 `LLM_OPENAI_MAX_TOKENS_PARAMETER=max_completion_tokens`；默认值为 `max_tokens`。
+
+配置示例（请在被忽略的 `.env` 文件中填入自己的密钥，不要提交密钥）：
+
+```dotenv
+LLM_PROVIDERS=deepseek,openai,local
+# 可选；未设置时使用显式列表或自动发现中的首个服务商。
+# LLM_DEFAULT_PROVIDER=deepseek
+LLM_TIMEOUT_SECONDS=120
+LLM_MAX_OUTPUT_TOKENS=8192
+
+LLM_DEEPSEEK_NAME=DeepSeek
+LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+LLM_DEEPSEEK_MODEL=deepseek-chat
+LLM_DEEPSEEK_API_KEY=
+LLM_DEEPSEEK_RESPONSE_FORMAT=json_object
+
+LLM_OPENAI_NAME=OpenAI
+LLM_OPENAI_BASE_URL=https://api.openai.com/v1
+LLM_OPENAI_MODEL=gpt-4.1-mini
+LLM_OPENAI_API_KEY=
+LLM_OPENAI_RESPONSE_FORMAT=json_schema
+LLM_OPENAI_MAX_TOKENS_PARAMETER=max_completion_tokens
+
+LLM_LOCAL_NAME=Local server
+LLM_LOCAL_BASE_URL=http://host.docker.internal:1234/v1
+LLM_LOCAL_MODEL=your-local-model
+LLM_LOCAL_API_KEY=
+LLM_LOCAL_RESPONSE_FORMAT=json_object
+```
+
+本地服务地址必须能被 API 进程访问。若 API 运行在 Compose 容器中，`localhost` 指向容器本身；请改用 `host.docker.internal` 或同一 Docker 网络中的服务名。
+
+PowerShell 调用示例：
+
+```powershell
+$body = @{
+  provider = 'deepseek'
+  source_language = 'en'
+  target_language = 'zh-Hans'
+  sentence_pairs = @(@{ id = 'demo'; source = 'He gave up.'; target = '他放弃了。' })
+} | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Uri 'http://localhost:8000/api/v1/llm/align' -Method Post -ContentType 'application/json' -Body $body
+```
 
 ## 测试
 
@@ -236,3 +400,5 @@ pip install -r requirements-dev.txt
 pytest
 ruff check .
 ```
+
+大模型客户端测试使用 Mock HTTP Transport，不会调用真实服务商；本地测试不代表真实模型的输出质量已经验证。

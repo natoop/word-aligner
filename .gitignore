@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 htmlcov/
 .coverage
+eval/data/XL-WA/
+eval/data/simalign/
+eval/results/
+.pytest-tmp-*/

@@ -29,6 +29,7 @@
     input:hover, select:hover, textarea:hover { border-color: #8aaeb0; }
     fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
     .settings { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin: 24px 0 4px; }
+    .engine-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 24px 0 4px; }
     .pair-inputs, .text-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
     .pair-editor { padding: 20px 0; border-bottom: 1px solid var(--line); }
     .pair-heading { margin-bottom: 12px; } .pair-title { font-size: 13px; color: var(--muted); }
@@ -73,7 +74,7 @@
     .json-panel { margin-top: 20px; } footer { margin-top: 24px; font-size: 12px; color: var(--muted); }
     @media (max-width: 720px) {
       header { padding: 25px 18px; } main { padding: 0 14px; margin-top: 18px; }
-      .panel, .result-card { padding: 18px; } .settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .panel, .result-card { padding: 18px; } .settings, .engine-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .pair-inputs, .text-columns { grid-template-columns: minmax(0, 1fr); gap: 14px; }
       .aligned-text { font-size: 16px; } .actions > div { width: 100%; } .primary { flex: 1; }
     }
@@ -94,22 +95,30 @@
             <h2 id="input-title">01 / 输入句对</h2>
             <button class="button" id="example" type="button">填入示例</button>
           </div>
-          <div class="settings">
+          <div class="engine-settings">
+            <label>对齐引擎<select id="engine"><option value="local">本地模型</option><option value="llm">大模型</option></select></label>
+            <div id="provider-field" hidden>
+              <label>服务商<select id="provider" disabled><option value="">正在加载服务商…</option></select></label>
+              <button class="button" id="refresh-providers" type="button">刷新服务商</button>
+            </div>
+          </div>
+          <p id="provider-hint" class="hint" role="status" aria-live="polite" hidden></p>
+          <div id="local-settings" class="settings">
             <label>原文语种<select id="source-language" required disabled><option value="">正在加载语种…</option></select></label>
             <label>译文语种<select id="target-language" required disabled><option value="">正在加载语种…</option></select></label>
-            <label>对齐方法<select id="method"><option value="itermax">itermax · 均衡</option><option value="inter">inter · 保守</option><option value="mwmf">mwmf · 最大权匹配</option></select></label>
-            <label>修正策略<select id="repair"><option value="conservative">conservative · 保守修正</option><option value="span-aware">span-aware · 短语扩展</option><option value="none">不修正 · 原始模型结果</option></select></label>
+            <label id="method-field">对齐方法<select id="method"><option value="itermax">itermax · 均衡</option><option value="inter">inter · 保守</option><option value="mwmf">mwmf · 最大权匹配</option></select></label>
+            <label id="repair-field">修正策略<select id="repair"><option value="conservative">conservative · 保守修正</option><option value="span-aware">span-aware · 短语扩展</option><option value="none">不修正 · 原始模型结果</option></select></label>
           </div>
           <p class="hint"><span id="language-hint" role="status" aria-live="polite">正在从 /api/v1/languages 加载支持的语种…</span> <button id="retry-languages" class="quiet" type="button" hidden>重试加载语种</button></p>
           <div id="pairs"></div>
           <div class="actions">
             <button class="button" id="add-pair" type="button">＋ 添加句对</button>
-            <span class="hint">每对文本独立对齐 · 最多 100 对</span>
+            <span id="pair-limit-hint" class="hint">每对文本独立对齐 · 最多 100 对</span>
           </div>
           <details>
             <summary>接口设置</summary>
             <label class="endpoint">对齐接口地址<input id="endpoint" type="text" value="/api/v1/align" required spellcheck="false"></label>
-            <p class="hint">默认调用当前服务的 /api/v1/align。本机测试地址为 http://localhost:8000/api/v1/align。跨域调用需要目标服务允许 CORS；建议通过服务的 /demo 访问本页。</p>
+            <p class="hint">引擎切换时会在 /api/v1/align 与 /api/v1/llm/align 间切换。本机测试地址示例为 http://localhost:8000/api/v1/align。跨域调用需要目标服务允许 CORS；建议通过服务的 /demo 访问本页。</p>
           </details>
         </fieldset>
         <div class="actions">
@@ -150,11 +159,15 @@
       ["#ab4d42", "#fcebe6"], ["#3f6e7d", "#e4f0f2"]
     ];
     const typeNames = { "one-to-one": "一对一", "one-to-many": "一对多", "many-to-one": "多对一", "many-to-many": "多对多" };
-    const originNames = { model: "模型", rule: "规则", repaired: "补充修正", refined: "短语精炼", mixed: "混合" };
+    const originNames = { model: "模型", rule: "规则", repaired: "补充修正", refined: "短语精炼", mixed: "混合", llm: "大模型" };
     let activeRequest = null;
     let lastResponse = null;
     let languageVersion = 0;
+    let providerVersion = 0;
     let languagesReady = false;
+    let providersReady = false;
+    let providerCatalog = [];
+    let engine = "local";
 
     function element(tag, className, text) {
       const node = document.createElement(tag);
@@ -169,17 +182,28 @@
       $("status").hidden = false;
     }
 
+    function updateSubmitState() {
+      const providerReady = engine !== "llm" || (providersReady && Boolean($("provider").value));
+      $("submit").disabled = Boolean(activeRequest) || !languagesReady || !providerReady;
+    }
+
+    function pairLimit() { return engine === "llm" ? 10 : 100; }
+
     function renumberPairs() {
       const pairs = [...$("pairs").children];
       pairs.forEach((pair, index) => {
         pair.querySelector(".pair-title").textContent = `句对 ${String(index + 1).padStart(2, "0")}`;
         pair.querySelector(".remove-pair").disabled = pairs.length === 1;
       });
-      $("add-pair").disabled = pairs.length >= 100;
+      const limit = pairLimit();
+      $("add-pair").disabled = pairs.length >= limit;
+      $("pair-limit-hint").textContent = engine === "llm"
+        ? `大模型每次接受 1–10 对；当前 ${pairs.length} 对${pairs.length > 10 ? "，请移除多余句对后提交" : ""}。`
+        : "每对文本独立对齐 · 最多 100 对";
     }
 
     function addPair(source = "", target = "") {
-      if ($("pairs").children.length >= 100) return;
+      if ($("pairs").children.length >= pairLimit()) return;
       const pair = $("pair-template").content.firstElementChild.cloneNode(true);
       pair.querySelector(".source").value = source;
       pair.querySelector(".target").value = target;
@@ -217,7 +241,7 @@
       const timer = setTimeout(() => controller.abort(), 8000);
       try {
         const url = endpointURL();
-        url.pathname = url.pathname.replace(/\/align\/?$/, "/languages");
+        url.pathname = url.pathname.replace(/\/(?:llm\/)?align\/?$/, "/languages");
         if (!/\/languages$/.test(url.pathname)) throw new Error("自定义接口");
         const response = await fetch(url, { signal: controller.signal });
         if (!response.ok) throw new Error("语种列表不可用");
@@ -227,29 +251,145 @@
         )) throw new Error("语种列表为空或格式不正确");
         if (version !== languageVersion) return;
         selectors.forEach((select, index) => {
-          select.replaceChildren(...data.languages.map((language) => {
+          const options = data.languages.map((language) => {
             const option = element("option", "", `${language.native_name} · ${language.name} (${language.code})`);
             option.value = language.code;
             return option;
-          }));
-          select.value = data.languages.some((language) => language.code === selected[index]) ? selected[index] : data.languages[0].code;
+          });
+          if (engine === "llm") {
+            const auto = element("option", "", "自动识别 (auto)");
+            auto.value = "auto";
+            options.unshift(auto);
+          }
+          select.replaceChildren(...options);
+          const hasSelectedLanguage = data.languages.some((language) => language.code === selected[index]);
+          const selectedIsAuto = engine === "llm" && selected[index] === "auto";
+          select.value = hasSelectedLanguage || selectedIsAuto ? selected[index] : data.languages[0].code;
           select.disabled = false;
         });
         languagesReady = true;
-        $("language-hint").textContent = `已从 /api/v1/languages 加载 ${data.languages.length} 种语种。`;
+        $("language-hint").textContent = engine === "llm"
+          ? `已加载 ${data.languages.length} 个常用语种选项。可选择自动识别；列表仅为常用选项，实际能力取决于所选模型。`
+          : `已从 /api/v1/languages 加载 ${data.languages.length} 种语种。`;
       } catch (error) {
         if (version === languageVersion) {
           selectors.forEach((select) => {
-            const option = element("option", "", "语种加载失败"); option.value = "";
-            select.replaceChildren(option);
+            if (engine === "llm") {
+              const auto = element("option", "", "自动识别 (auto)");
+              auto.value = "auto";
+              select.replaceChildren(auto);
+              select.value = "auto";
+              select.disabled = false;
+            } else {
+              const option = element("option", "", "语种加载失败"); option.value = "";
+              select.replaceChildren(option);
+            }
           });
-          $("language-hint").textContent = "无法加载支持的语种，请检查接口地址与服务状态后重试。";
+          languagesReady = engine === "llm";
+          $("language-hint").textContent = engine === "llm"
+            ? "无法加载常用语种列表，已启用自动识别。列表仅为常用选项，实际能力取决于所选模型；仍可使用自动识别，也可稍后重试。"
+            : "无法加载支持的语种，请检查接口地址与服务状态后重试。";
           $("retry-languages").hidden = false;
         }
       } finally {
         clearTimeout(timer);
-        if (version === languageVersion) $("submit").disabled = Boolean(activeRequest) || !languagesReady;
+        if (version === languageVersion) updateSubmitState();
       }
+    }
+
+    async function loadProviders() {
+      const version = ++providerVersion;
+      const select = $("provider");
+      const previousSelection = select.value;
+      providersReady = false;
+      providerCatalog = [];
+      select.disabled = true;
+      select.replaceChildren(element("option", "", "正在加载服务商…"));
+      select.options[0].value = "";
+      $("provider-hint").textContent = "正在从 /api/v1/llm/providers 加载可用服务商…";
+      $("provider-hint").hidden = false;
+      updateSubmitState();
+      const timerController = new AbortController();
+      const timer = setTimeout(() => timerController.abort(), 8000);
+      try {
+        const alignURL = endpointURL();
+        const url = new URL("/api/v1/llm/providers", alignURL.origin);
+        const response = await fetch(url, { signal: timerController.signal });
+        const raw = await response.text();
+        let data;
+        try { data = JSON.parse(raw); }
+        catch { throw new Error("服务商列表格式不正确"); }
+        if (!response.ok) throw new Error(data?.message || data?.detail || "服务商列表不可用");
+        if (!Array.isArray(data.providers) || !data.providers.every((provider) =>
+          provider && typeof provider.id === "string" && provider.id && typeof provider.name === "string" && typeof provider.model === "string"
+        )) throw new Error("服务商列表格式不正确");
+        if (version !== providerVersion) return;
+        providerCatalog = data.providers;
+        select.replaceChildren(...data.providers.map((provider) => {
+          const option = element("option", "", `${provider.name} · ${provider.model}`);
+          option.value = provider.id;
+          return option;
+        }));
+        if (data.providers.length) {
+          const selected = data.providers.some((provider) => provider.id === previousSelection) ? previousSelection
+            : data.providers.some((provider) => provider.id === data.default_provider) ? data.default_provider
+              : data.providers[0].id;
+          select.value = selected;
+          providersReady = true;
+          select.disabled = false;
+          $("provider-hint").textContent = `已加载 ${data.providers.length} 个服务商。`;
+        } else {
+          const empty = element("option", "", "没有已配置的服务商");
+          empty.value = "";
+          empty.disabled = true;
+          select.append(empty);
+          select.value = "";
+          $("provider-hint").textContent = "尚未配置大模型服务商。请在服务端 .env 配置后重试；本地模型仍可正常使用。";
+        }
+      } catch (error) {
+        if (version === providerVersion) {
+          select.replaceChildren(element("option", "", "服务商加载失败"));
+          select.options[0].value = "";
+          $("provider-hint").textContent = "无法加载大模型服务商。请检查接口地址和服务状态；若尚未配置，请在服务端 .env 配置后点击刷新。本地模型仍可使用。";
+        }
+      } finally {
+        clearTimeout(timer);
+        if (version === providerVersion) updateSubmitState();
+      }
+    }
+
+    function switchEngine(nextEngine) {
+      if (nextEngine === engine) return;
+      engine = nextEngine;
+      const endpoint = $("endpoint");
+      try {
+        const url = endpointURL();
+        const path = url.pathname.replace(/\/+$/, "");
+        if (engine === "llm") {
+          if (/\/llm\/align$/.test(path)) { /* already selected */ }
+          else if (/\/align$/.test(path)) url.pathname = path.replace(/\/align$/, "/llm/align");
+          else url.pathname = "/api/v1/llm/align";
+        } else if (/\/llm\/align$/.test(path)) {
+          url.pathname = path.replace(/\/llm\/align$/, "/align");
+        } else if (!/\/align$/.test(path)) {
+          url.pathname = "/api/v1/align";
+        }
+        endpoint.value = url.toString();
+      } catch {
+        endpoint.value = engine === "llm" ? "/api/v1/llm/align" : "/api/v1/align";
+      }
+      $("provider-field").hidden = engine !== "llm";
+      $("provider-hint").hidden = engine !== "llm";
+      $("method-field").hidden = engine === "llm";
+      $("repair-field").hidden = engine === "llm";
+      renumberPairs();
+      loadLanguages();
+      if (engine === "llm") loadProviders();
+      else {
+        providerVersion++;
+        providersReady = false;
+      }
+      updateSubmitState();
     }
 
     function applyColor(node, groupIndex) {
@@ -258,17 +398,21 @@
       node.style.setProperty("--group-bg", background);
     }
 
-    function groupPhrase(sentence, side, indices) {
+    function textSlice(text, start, end, offsetUnit) {
+      return offsetUnit === "utf16" ? text.slice(start, end) : Array.from(text).slice(start, end).join("");
+    }
+
+    function groupPhrase(sentence, side, indices, offsetUnit) {
       const tokens = new Map(sentence[`${side}_tokens`].map((token) => [token.index, token]));
       const selected = [...indices].sort((a, b) => a - b).map((index) => tokens.get(index)).filter(Boolean);
       if (!selected.length) return "∅";
       if (selected.every((token, index) => index === 0 || token.index === selected[index - 1].index + 1)) {
-        return Array.from(sentence[side]).slice(selected[0].start, selected[selected.length - 1].end).join("");
+        return textSlice(sentence[side], selected[0].start, selected[selected.length - 1].end, offsetUnit);
       }
       return selected.map((token) => token.text).join(" … ");
     }
 
-    function renderSentence(sentence, position) {
+    function renderSentence(sentence, position, offsetUnit) {
       const groups = sentence.alignment_groups;
       const card = element("article", "result-card");
       const heading = element("div", "result-heading");
@@ -310,14 +454,13 @@
         const text = element("div", "aligned-text");
         text.dir = "auto";
         textBlocks.push(text);
-        // Python offsets count Unicode code points. Array.from also handles non-BMP characters.
-        const characters = Array.from(sentence[side]);
+        const textLength = offsetUnit === "utf16" ? sentence[side].length : Array.from(sentence[side]).length;
         let cursor = 0;
         const unaligned = new Set(sentence[`unaligned_${side}_indices`]);
         for (const token of sentence[`${side}_tokens`]) {
-          text.append(document.createTextNode(characters.slice(cursor, token.start).join("")));
+          text.append(document.createTextNode(textSlice(sentence[side], cursor, token.start, offsetUnit)));
           const ids = groups.flatMap((group, index) => group[`${side}_indices`].includes(token.index) ? [index] : []);
-          const node = element("button", "token", characters.slice(token.start, token.end).join(""));
+          const node = element("button", "token", textSlice(sentence[side], token.start, token.end, offsetUnit));
           node.type = "button";
           node.classList.toggle("unaligned", unaligned.has(token.index));
           node.classList.toggle("protected", Boolean(token.is_protected));
@@ -328,7 +471,7 @@
           text.append(node);
           cursor = token.end;
         }
-        text.append(document.createTextNode(characters.slice(cursor).join("")));
+        text.append(document.createTextNode(textSlice(sentence[side], cursor, textLength, offsetUnit)));
         block.append(text);
         columns.append(block);
       }
@@ -357,7 +500,7 @@
           number.append(button);
           row.append(number);
           for (const side of ["source", "target"]) {
-            const cell = element("td", "phrase", groupPhrase(sentence, side, group[`${side}_indices`]));
+            const cell = element("td", "phrase", groupPhrase(sentence, side, group[`${side}_indices`], offsetUnit));
             cell.dir = "auto"; row.append(cell);
           }
           const kind = element("td");
@@ -365,8 +508,10 @@
           kind.append(element("span", "muted", originNames[group.origin] || group.origin));
           if (group.links.length === 0) kind.append(element("div", "hint", "仅短语组，无原子链接"));
           row.append(kind);
-          row.append(element("td", "score", `${(group.similarity * 100).toFixed(1)}%`));
-          row.append(element("td", "score", `${(group.confidence * 100).toFixed(1)}%`));
+          const similarity = Number.isFinite(group.similarity) ? `${(group.similarity * 100).toFixed(1)}%` : "—";
+          const confidence = Number.isFinite(group.confidence) ? `${(group.confidence * 100).toFixed(1)}%` : "—";
+          row.append(element("td", "score", similarity));
+          row.append(element("td", "score", confidence));
           connect(row, [index]);
           interactive.push({ node: button, ids: [index] });
           body.append(row);
@@ -377,7 +522,7 @@
       }
       for (const [side, label] of [["source", "原文"], ["target", "译文"]]) {
         const indices = sentence[`unaligned_${side}_indices`];
-        if (indices.length) card.append(element("p", "unaligned-note", `${label}未对齐（${indices.length}）：${groupPhrase(sentence, side, indices)}`));
+        if (indices.length) card.append(element("p", "unaligned-note", `${label}未对齐（${indices.length}）：${groupPhrase(sentence, side, indices, offsetUnit)}`));
       }
       highlight();
       return card;
@@ -390,10 +535,36 @@
       return `HTTP ${status}：${data?.message || data?.detail || data?.error || "接口请求失败，请检查服务日志。"}`;
     }
 
+    function resultMeta(data) {
+      const parts = [];
+      if (data.source_language || data.target_language) parts.push(`${data.source_language || "?"} → ${data.target_language || "?"}`);
+      if (engine === "llm" || data.method === "llm") {
+        const provider = data.provider_name || providerCatalog.find((item) => item.id === data.provider)?.name || data.provider || "未知";
+        parts.push(`大模型 · 服务商 ${provider}`);
+        if (data.model) parts.push(`模型 ${data.model}`);
+        const usage = data.usage;
+        const usageParts = [];
+        if (usage && Number.isFinite(usage.prompt_tokens)) usageParts.push(`输入 ${usage.prompt_tokens}`);
+        if (usage && Number.isFinite(usage.completion_tokens)) usageParts.push(`输出 ${usage.completion_tokens}`);
+        if (usage && Number.isFinite(usage.total_tokens)) usageParts.push(`合计 ${usage.total_tokens}`);
+        parts.push(usageParts.length ? `用量 ${usageParts.join(" / ")} tokens` : "用量未提供");
+      } else {
+        if (data.model) parts.push(`模型 ${data.model}`);
+        if (data.method) parts.push(`方法 ${data.method}`);
+        if (data.embedding_layer !== undefined && data.embedding_layer !== null) parts.push(`Embedding 层 ${data.embedding_layer}`);
+        if (data.confidence_method) parts.push(`置信度 ${data.confidence_method}`);
+      }
+      return parts.join(" · ");
+    }
+
     $("align-form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      if (activeRequest || !languagesReady) return;
+      if (activeRequest || !languagesReady || (engine === "llm" && (!providersReady || !$("provider").value))) return;
       const pairs = [...$("pairs").children];
+      if (engine === "llm" && pairs.length > 10) {
+        showStatus(`大模型接口每次最多接受 10 对句子；当前有 ${pairs.length} 对，请移除多余句对后再提交。`, "error");
+        return;
+      }
       for (const pair of pairs) {
         for (const input of pair.querySelectorAll("textarea")) {
           if (!input.value.trim()) { input.setCustomValidity("请输入至少一个非空白字符。"); input.reportValidity(); return; }
@@ -401,10 +572,13 @@
       }
       const payload = {
         source_language: $("source-language").value.trim(), target_language: $("target-language").value.trim(),
-        method: $("method").value,
         sentence_pairs: pairs.map((pair, index) => ({ id: `sentence-${index + 1}`, source: pair.querySelector(".source").value, target: pair.querySelector(".target").value }))
       };
-      if ($("repair").value !== "none") payload.repair = { enabled: true, strategy: $("repair").value };
+      if (engine === "llm") payload.provider = $("provider").value;
+      else {
+        payload.method = $("method").value;
+        if ($("repair").value !== "none") payload.repair = { enabled: true, strategy: $("repair").value };
+      }
       const controller = new AbortController();
       activeRequest = controller;
       $("form-fields").disabled = true;
@@ -413,7 +587,7 @@
       $("results").hidden = true;
       $("empty").hidden = true;
       lastResponse = null;
-      showStatus("正在对齐，请稍候… 首次请求可能需要加载模型。", "loading");
+      showStatus(engine === "llm" ? "正在调用所选大模型进行对齐…" : "正在对齐，请稍候… 首次请求可能需要加载模型。", "loading");
       const started = performance.now();
       try {
         const response = await fetch(endpointURL(), {
@@ -425,11 +599,12 @@
         try { data = JSON.parse(raw); }
         catch { throw new Error(`HTTP ${response.status}：接口未返回有效 JSON，请检查接口地址和服务状态。`); }
         if (!response.ok) throw new Error(errorMessage(data, response.status));
-        if (!Array.isArray(data?.sentence_alignments)) throw new Error("接口响应缺少 sentence_alignments，请确认调用的是 /api/v1/align。");
-        $("sentence-results").replaceChildren(...data.sentence_alignments.map(renderSentence));
+        if (!Array.isArray(data?.sentence_alignments)) throw new Error("接口响应缺少 sentence_alignments，请检查对齐接口地址。");
+        const offsetUnit = data.offset_unit === "utf16" ? "utf16" : "codepoint";
+        $("sentence-results").replaceChildren(...data.sentence_alignments.map((sentence, index) => renderSentence(sentence, index, offsetUnit)));
         $("request-json").textContent = JSON.stringify(payload, null, 2);
         $("response-json").textContent = JSON.stringify(data, null, 2);
-        $("result-meta").textContent = `${data.source_language} → ${data.target_language} · ${data.model} · ${data.method} · Embedding 层 ${data.embedding_layer} · 置信度 ${data.confidence_method}`;
+        $("result-meta").textContent = resultMeta(data);
         lastResponse = data;
         $("results").hidden = false;
         showStatus(`对齐完成：${data.sentence_alignments.length} 个句对，用时 ${((performance.now() - started) / 1000).toFixed(2)} 秒。`, "success");
@@ -439,7 +614,7 @@
       } finally {
         activeRequest = null;
         $("form-fields").disabled = false;
-        $("submit").disabled = !languagesReady;
+        updateSubmitState();
         $("cancel").hidden = true;
       }
     });
@@ -447,7 +622,13 @@
     $("cancel").addEventListener("click", () => activeRequest?.abort());
     $("add-pair").addEventListener("click", () => addPair().querySelector("textarea").focus());
     $("example").addEventListener("click", loadExample);
-    $("endpoint").addEventListener("change", loadLanguages);
+    $("engine").addEventListener("change", (event) => switchEngine(event.target.value));
+    $("provider").addEventListener("change", updateSubmitState);
+    $("refresh-providers").addEventListener("click", loadProviders);
+    $("endpoint").addEventListener("change", () => {
+      loadLanguages();
+      if (engine === "llm") loadProviders();
+    });
     $("retry-languages").addEventListener("click", loadLanguages);
     $("download").addEventListener("click", () => {
       if (!lastResponse) return;
@@ -458,6 +639,7 @@
     });
     if (location.protocol === "file:") $("endpoint").value = "http://localhost:8000/api/v1/align";
     addPair("This is a machine translation example.", "这是一个机器翻译示例。");
+    renumberPairs();
     loadLanguages();
   </script>
 </body>
